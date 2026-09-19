@@ -11,6 +11,26 @@ import kotlin.math.hypot
 data class RoadNode(val id: String, val east: Double, val north: Double)
 data class RoadEdge(val to: String, val cost: Double)
 
+/** Map-matched road segment in lat/lon: directed edge a->b plus the projection. */
+data class RoadSnapLatLon(
+    val aLat: Double, val aLon: Double,
+    val bLat: Double, val bLon: Double,
+    val projLat: Double, val projLon: Double,
+    /** Lateral distance from the query point to the segment (m). */
+    val lateralM: Double,
+    /** Edge/travel alignment: +1 along travel, -1 against it. */
+    val align: Double
+)
+
+/** Map-matched road segment in a graph's ENU frame (see [OfflineRoadGraph.snapToRoad]). */
+data class RoadSnapEnu(
+    val aEast: Double, val aNorth: Double,
+    val bEast: Double, val bNorth: Double,
+    val projEast: Double, val projNorth: Double,
+    val lateralM: Double,
+    val align: Double
+)
+
 class OfflineRoadGraph private constructor(
     val originLat: Double,
     val originLon: Double,
@@ -81,8 +101,44 @@ class OfflineRoadGraph private constructor(
         return pts
     }
 
-    /** Dijkstra node-id path, or null when the goal is unreachable from start. */
-    private fun dijkstraIds(start: String, goal: String, endEast: Double, endNorth: Double): List<String>? {
+    /**
+     * Destination-less map matching: nearest directed edge to (east,north),
+     * scored by lateral distance minus an alignment bonus for pointing along
+     * [headingRad] (compass radians, 0 = North) — same scoring as
+     * [routeWithHeading], but returns the segment instead of routing.
+     * Null when no edge is within [SEARCH_RADIUS_M].
+     */
+    fun snapToRoad(
+        startEast: Double, startNorth: Double,
+        headingRad: Double
+    ): RoadSnapEnu? {
+        val hx = kotlin.math.sin(headingRad); val hy = kotlin.math.cos(headingRad)
+        var best: RoadSnapEnu? = null
+        var bestScore = Double.POSITIVE_INFINITY
+        for ((id, node) in nodes) {
+            if (hypot(node.east - startEast, node.north - startNorth) > SEARCH_RADIUS_M) continue
+            for (edge in adjacency[id].orEmpty()) {
+                val nb = nodes[edge.to] ?: continue
+                val dx = nb.east - node.east; val dy = nb.north - node.north
+                val len = hypot(dx, dy); if (len < 1e-6) continue
+                val ux = dx / len; val uy = dy / len
+                val t = (((startEast - node.east) * dx + (startNorth - node.north) * dy) / (len * len))
+                    .coerceIn(0.0, 1.0)
+                val qx = node.east + t * dx; val qy = node.north + t * dy
+                val d = hypot(startEast - qx, startNorth - qy)
+                if (d > SEARCH_RADIUS_M) continue
+                val align = ux * hx + uy * hy
+                val score = d - ALIGN_WEIGHT_M * align
+                if (score < bestScore) {
+                    bestScore = score
+                    best = RoadSnapEnu(node.east, node.north, nb.east, nb.north, qx, qy, d, align)
+                }
+            }
+        }
+        return best
+    }
+
+    /** Dijkstra node-id path, or null when the goal is unreachable from start. */    private fun dijkstraIds(start: String, goal: String, endEast: Double, endNorth: Double): List<String>? {
         val dist = mutableMapOf(start to 0.0); val prev = mutableMapOf<String, String?>(); prev[start] = null
         val q = PriorityQueue(compareBy<Pair<Double, String>> { it.first }); q.add(0.0 to start)
         while (q.isNotEmpty()) {
@@ -189,6 +245,40 @@ class OfflineRoadGraphCatalog(private val graphs: List<OfflineRoadGraph>) {
         val selected = candidates.firstOrNull()
         lastUsedNearestRoadFallback = selected?.first?.lastUsedNearestRoadFallback == true
         return selected?.second ?: emptyList()
+    }
+
+    /**
+     * Destination-less map matching across all graphs: nearest directed road
+     * edge to (lat,lon), preferring the edge pointing along [headingDeg]
+     * (compass degrees, 0 = North). Null when no graph covers the point
+     * (e.g. relative tracks far from the bundled extracts).
+     */
+    fun snapToRoad(lat: Double, lon: Double, headingDeg: Float): RoadSnapLatLon? {
+        if (!lat.isFinite() || !lon.isFinite() || !headingDeg.isFinite()) return null
+        val headingRad = Math.toRadians(headingDeg.toDouble())
+        var best: RoadSnapLatLon? = null
+        var bestScore = Double.POSITIVE_INFINITY
+        for (graph in graphs) {
+            val scale = 6378137.0
+            val c = kotlin.math.cos(Math.toRadians(graph.originLat))
+            val se = Math.toRadians(lon - graph.originLon) * scale * c
+            val sn = Math.toRadians(lat - graph.originLat) * scale
+            if (graph.nearestDistance(se, sn) > OfflineRoadGraph.SEARCH_RADIUS_M) continue
+            val snap = graph.snapToRoad(se, sn, headingRad) ?: continue
+            val score = snap.lateralM - OfflineRoadGraph.ALIGN_WEIGHT_M * snap.align
+            if (score < bestScore) {
+                bestScore = score
+                fun toLat(n: Double) = Math.toDegrees(n / scale) + graph.originLat
+                fun toLon(e: Double) = Math.toDegrees(e / (scale * c)) + graph.originLon
+                best = RoadSnapLatLon(
+                    toLat(snap.aNorth), toLon(snap.aEast),
+                    toLat(snap.bNorth), toLon(snap.bEast),
+                    toLat(snap.projNorth), toLon(snap.projEast),
+                    snap.lateralM, snap.align
+                )
+            }
+        }
+        return best
     }
 
     companion object {

@@ -150,10 +150,22 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
     private val offRouteDetector = OffRouteDetector()
     private var recalculating = false
 
+    companion object {
+        /** DR-only route rebuilds above this uncertainty do more harm than good. */
+        private const val DR_RECALC_MAX_CONF_M = 30f
+    }
+
     init {
         orientationManager.start()
         imuManager.listener = ::onImuSample
         gpsManager.listener = ::onGpsSample
+        // Destination-less map matching: when no route is planned the engine
+        // snaps onto the nearest road in the direction of travel (offline
+        // graphs, IMU thread, throttled inside the engine).
+        vehicleEngine.roadSnapper =
+            com.sih.idr.navigation.RoadSnapProvider { lat, lon, headingDeg ->
+                roadGraph.snapToRoad(lat, lon, headingDeg)
+            }
         // Testing Mode defaults ON -> GPS runs continuously from launch,
         // but ONLY if permission is already granted (else wait for the grant callback).
         startGpsIfPermitted()
@@ -296,6 +308,13 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         val dest = destination ?: return
         if (plannedRouteLatLon.size < 2 || recalculating) return
         val pose = currentPose() ?: return
+        // Guard: rebuilding the road network from a drifted DR-only pose bakes
+        // the drift into the new route and pins the trail to the wrong road.
+        // Hold (free inertial coast) until GPS returns or confidence recovers.
+        if (pose.source == "DR") {
+            val conf = vehicleEngine.currentState?.confidenceMeters ?: Float.MAX_VALUE
+            if (!conf.isFinite() || conf > DR_RECALC_MAX_CONF_M) return
+        }
         when (val d = offRouteDetector.update(
             System.currentTimeMillis(), pose.lat, pose.lon,
             pose.headingDeg, pose.speedMps, plannedRouteLatLon
