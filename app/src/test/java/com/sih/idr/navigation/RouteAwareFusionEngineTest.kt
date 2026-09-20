@@ -32,8 +32,9 @@ class RouteAwareFusionEngineTest {
         engine.initialize(createInitialState(speed = 0f, heading = 0f))
 
         var timeNanos = 1_000_000_000L
-        // Feed 50 samples (0.5s @ 100 Hz) of stationary IMU data with slight sensor noise (bias = 0.05 m/s^2)
-        for (i in 0 until 50) {
+        // Feed 140 samples (1.4s @ 100 Hz) of stationary IMU data with slight sensor noise (bias = 0.05 m/s^2)
+        // STANDSTILL_MIN_TIME_S is 1.2s to prevent cruising false-triggers
+        for (i in 0 until 140) {
             timeNanos += 10_000_000L // 10ms (100 Hz)
             val sample = ImuSample(
                 timestampNanos = timeNanos,
@@ -49,6 +50,55 @@ class RouteAwareFusionEngineTest {
         assertEquals(0.0, engine.forwardSpeed, 1e-6)
         assertEquals(0.0, engine.currentState?.velEast?.toDouble() ?: 0.0, 1e-6)
         assertEquals(0.0, engine.currentState?.velNorth?.toDouble() ?: 0.0, 1e-6)
+    }
+
+    @Test
+    fun testNoEndpointLockWhenPassingRouteSegment() {
+        val engine = RouteAwareFusionEngine()
+        val startLat = 16.3067
+        val startLon = 80.4365
+        engine.initialize(createInitialState(lat = startLat, lon = startLon, speed = 5f, heading = 90f))
+
+        // Short segment of 10 meters East
+        val p0 = startLat to startLon
+        val p1 = com.sih.idr.utils.GeoUtils.moveEnu(startLat, startLon, 0.0, 10.0)
+        engine.setRouteLatLon(listOf(p0, p1))
+
+        // Move 25 meters East (15 meters beyond the segment end)
+        val beyond = com.sih.idr.utils.GeoUtils.moveEnu(startLat, startLon, 0.0, 25.0)
+        val enu25 = com.sih.idr.utils.GeoUtils.geodeticToEnu(beyond.first, beyond.second, 0.0, startLat, startLon, 0.0)
+
+        // Segment 0: from (0,0) to (10,0)
+        val snapped = engine.constrainToRoute(enu25.x, enu25.y)
+        // Since tRaw = 25/10 = 2.5 > 1.05, it must NOT snap to the end vertex (10.0, 0.0)!
+        assertNull("Vehicle beyond segment must not be locked to endpoint", snapped)
+    }
+
+    @Test
+    fun testPedestrianStepImpulsesAdvanceSpeed() {
+        val engine = RouteAwareFusionEngine()
+        engine.initialize(createInitialState(speed = 0f, heading = 0f))
+
+        // Simulate walking footsteps: periodic vertical acceleration peak (~14 m/s^2) every 500ms
+        var timeNanos = 1_000_000_000L
+        for (step in 0 until 5) {
+            for (i in 0 until 50) { // 500ms per cycle
+                timeNanos += 10_000_000L
+                val isPeak = (i == 10)
+                val az = if (isPeak) 14.5f else 9.81f
+                val sample = ImuSample(
+                    timestampNanos = timeNanos,
+                    accelX = 0f, accelY = 0.5f, accelZ = az,
+                    gyroX = 0.01f, gyroY = 0.01f, gyroZ = 0.01f,
+                    linearX = 0f, linearY = 0.5f, linearZ = az - 9.81f,
+                    quatX = 0f, quatY = 0f, quatZ = 0f, quatW = 1f
+                )
+                engine.processImu(sample)
+            }
+        }
+
+        assertTrue("Step counter should register footsteps", engine.stepCount >= 3)
+        assertTrue("Pedestrian speed should be maintained", engine.forwardSpeed > 0.5)
     }
 
     @Test

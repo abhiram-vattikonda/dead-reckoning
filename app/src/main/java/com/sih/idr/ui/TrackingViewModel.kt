@@ -2,6 +2,7 @@ package com.sih.idr.ui
 
 import android.Manifest
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
@@ -151,8 +152,8 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
     private var recalculating = false
 
     companion object {
-        /** DR-only route rebuilds above this uncertainty do more harm than good. */
-        private const val DR_RECALC_MAX_CONF_M = 30f
+        /** DR-only route rebuilds above this uncertainty do more harm than good (relaxed for GPS outage). */
+        private const val DR_RECALC_MAX_CONF_M = 200f
     }
 
     init {
@@ -374,9 +375,39 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             false
         }
     }
+    private fun getCachedLocationFix(): GpsSample? {
+        val prefs = getApplication<Application>().getSharedPreferences("idr_nav_prefs", Context.MODE_PRIVATE)
+        val lat = prefs.getString("last_lat", null)?.toDoubleOrNull() ?: return null
+        val lon = prefs.getString("last_lon", null)?.toDoubleOrNull() ?: return null
+        val bearing = prefs.getString("last_bearing", null)?.toFloatOrNull()
+        val alt = prefs.getString("last_alt", null)?.toDoubleOrNull()
+        val time = prefs.getLong("last_time", System.currentTimeMillis())
+        return GpsSample(
+            timestampMillis = time,
+            latitude = lat,
+            longitude = lon,
+            altitude = alt,
+            speed = 0f,
+            bearing = bearing,
+            accuracy = 10f,
+            provider = "cached"
+        )
+    }
+
+    private fun saveLocationFix(sample: GpsSample) {
+        val prefs = getApplication<Application>().getSharedPreferences("idr_nav_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString("last_lat", sample.latitude.toString())
+            .putString("last_lon", sample.longitude.toString())
+            .putString("last_bearing", sample.bearing?.toString())
+            .putString("last_alt", sample.altitude?.toString())
+            .putLong("last_time", sample.timestampMillis)
+            .apply()
+    }
+
     /** Seed DR from the latest known GPS fix and start IMU-only navigation. */
     private fun enableNavEngine() {
-        val fix = gpsManager.lastFix.value
+        val fix = gpsManager.lastFix.value ?: getCachedLocationFix()
         engine.reset()
         lastDrPointMs = 0L
         if (fix != null) {
@@ -408,21 +439,31 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
                     requestRoadRoute(fix.latitude, fix.longitude, lat, lon, fix.bearing?.toDouble())
                 }
             }
+            val isLive = isLocationEnabled() && gpsManager.lastFix.value != null
             val ageS = (System.currentTimeMillis() - fix.timestampMillis) / 1000
-            seedInfo.value =
+            seedInfo.value = if (isLive) {
                 "DR seed: GPS fix, age ${ageS}s @ (%.5f, %.5f)".format(fix.latitude, fix.longitude)
+            } else {
+                "DR seed: Saved position (GPS off) @ (%.5f, %.5f)".format(fix.latitude, fix.longitude)
+            }
             hasGpsSeed.value = true
-            _messages.tryEmit("Navigation engine ON — seeded from GPS, now IMU-only")
+            _messages.tryEmit(if (isLive) "Navigation engine ON — seeded from GPS, now IMU-only" else "Navigation engine ON — seeded from saved position (GPS off)")
         } else {
-            // No GPS ever seen (e.g. phone location off since boot):
-            // run a relative track, clearly labeled as having no absolute position.
+            // Default to bundled test region (Guntur origin)
+            val defaultLat = 16.31374
+            val defaultLon = 80.43404
             val startYaw = orientationManager.currentYawDeg() ?: 0f
             engine.initialize(
-                NavigationState(timestampNanos = System.nanoTime(), latitude = 0.0, longitude = 0.0, headingDeg = startYaw)
+                NavigationState(timestampNanos = System.nanoTime(), latitude = defaultLat, longitude = defaultLon, headingDeg = startYaw)
             )
-            seedInfo.value = "DR seed: NONE — relative track (no absolute position)"
-            hasGpsSeed.value = false
-            _messages.tryEmit("Navigation engine ON: no GPS seed, recording relative track")
+            destination?.let { (lat, lon) ->
+                plannedRouteLatLon = listOf(defaultLat to defaultLon, lat to lon)
+                vehicleEngine.setDestination(lat, lon)
+                requestRoadRoute(defaultLat, defaultLon, lat, lon, startYaw.toDouble())
+            }
+            seedInfo.value = "DR seed: Guntur test center @ (%.4f, %.4f)".format(defaultLat, defaultLon)
+            hasGpsSeed.value = true
+            _messages.tryEmit("Navigation engine ON: offline test seed, running on IMU")
         }
         navEngineEnabled.value = true
         offRouteDetector.reset()
@@ -528,8 +569,8 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------- internals
     private fun beginSession() {
         session = TestSession(startTimestampMillis = System.currentTimeMillis())
-        // Log the current fix as the first blue point if we have one — no requirement.
-        gpsManager.lastFix.value?.let { fix ->
+        val startFix = gpsManager.lastFix.value ?: getCachedLocationFix()
+        startFix?.let { fix ->
             session?.gpsSamples?.add(fix)
             session?.gpsTrajectory?.add(TrajectoryPoint(fix.timestampMillis, fix.latitude, fix.longitude))
         }
@@ -547,7 +588,7 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         refreshDrStatus()
         _messages.tryEmit(
             if (isLocationEnabled()) "Session started — enable the navigation engine when ready"
-            else "Session started with phone GPS OFF — logging IMU; blue trail resumes when GPS returns"
+            else "Session started with phone GPS OFF — Dead Reckoning running on IMU"
         )
         pushSnapshot(force = true)
     }
@@ -586,6 +627,7 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Runs on the main looper. GPS truth path — independent of the engine. */
     private fun onGpsSample(sample: GpsSample) {
+        saveLocationFix(sample)
         if (!_isRecording.value) {
             // Not recording (Testing Mode idle): still refresh the map position.
             pushSnapshot(force = false)
@@ -637,7 +679,7 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             imuHz = imuManager.measuredHz,
             gpsCount = s?.gpsSamples?.size ?: 0,
             drStateCount = s?.drStates?.size ?: 0,
-            stepCount = s?.pdrDebug?.count { it.stepDetected } ?: 0,
+            stepCount = s?.pdrDebug?.count { it.stepDetected } ?: vehicleEngine.stepCount,
             locationOn = isLocationEnabled()
             ,plannedRoute = plannedRouteLatLon.mapIndexed { i, p -> TrajectoryPoint(i.toLong(), p.first, p.second) }
             ,engineHealth = buildString {

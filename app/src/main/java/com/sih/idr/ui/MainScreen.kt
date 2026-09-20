@@ -88,17 +88,15 @@ fun MainScreen(viewModel: TrackingViewModel, locationGranted: Boolean) {
             // ---------------------------------------------------------- MAP
             MapComponent(
                 gpsPoints = snapshot.gpsTrajectory,
-                // Relative track (no GPS seed) has no absolute position: hide it so
-                // the map never flies to the null-island origin. Shape is in the CSV.
-                drPoints = if (hasSeed) snapshot.drTrajectory else emptyList(),
+                drPoints = snapshot.drTrajectory,
                 gpsPos = snapshot.lastGps?.let {
                     TrajectoryPoint(it.timestampMillis, it.latitude, it.longitude)
                 },
-                drPos = if (hasSeed) snapshot.lastDr?.let {
+                drPos = snapshot.lastDr?.let {
                     TrajectoryPoint(
                         it.timestampNanos / 1_000_000, it.latitude, it.longitude
                     )
-                } else null,
+                },
                 plannedRoute = snapshot.plannedRoute,
                 follow = follow,
                 modifier = Modifier.fillMaxWidth().weight(1f),
@@ -208,9 +206,9 @@ fun MainScreen(viewModel: TrackingViewModel, locationGranted: Boolean) {
                 Text(seedInfo, fontSize = 13.sp, color = Color.DarkGray)
                 if (navEngineOn && !hasSeed) {
                     Text(
-                        "No GPS seed — relative track only (no absolute position). " +
-                            "Trail shape is recorded to CSV; enable location for absolute DR.",
-                        color = Color(0xFFB3261E), fontSize = 13.sp, fontWeight = FontWeight.Bold
+                        "No live GPS fix — using offline test reference. " +
+                            "DR runs on IMU from this location.",
+                        color = Color(0xFF188038), fontSize = 13.sp, fontWeight = FontWeight.Bold
                     )
                 }
                 Text("Route destination (optional)", fontWeight = FontWeight.Bold)

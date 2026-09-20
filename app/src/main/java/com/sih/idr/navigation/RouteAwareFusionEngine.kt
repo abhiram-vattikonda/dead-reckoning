@@ -98,6 +98,10 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
     override var lastDebug: com.sih.idr.navigation.pdr.PdrDebug? = null
         private set
 
+    private val stepCounter = com.sih.idr.navigation.pdr.DynamicStepCounter(1.0)
+    var stepCount = 0
+        private set
+
     private var route: MutableList<Pair<Double, Double>> = mutableListOf()
     private var routeCumDist: DoubleArray = DoubleArray(0)
     private var destinationLat: Double? = null
@@ -278,16 +282,21 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             aNorth = -fax * cosH + fay * sinH
         }
 
-        // 5. Standstill Detection & Zero Velocity Update (ZUPT)
+        // 5. Motion Classification: Step Detection & Standstill (ZUPT)
+        val rawAcc = sqrt(sample.accelX * sample.accelX + sample.accelY * sample.accelY + sample.accelZ * sample.accelZ).toDouble()
+        val isStep = stepCounter.findStep(rawAcc)
+        if (isStep) stepCount++
+
         val gyroRate = sqrt(sample.gyroX * sample.gyroX + sample.gyroY * sample.gyroY + sample.gyroZ * sample.gyroZ)
-        val isQuiet = gyroRate < STANDSTILL_GYRO_MAX && aMag < STANDSTILL_ACC_MAX
+        val isQuiet = gyroRate < STANDSTILL_GYRO_MAX && aMag < STANDSTILL_ACC_MAX && !isStep
         if (isQuiet) {
             stillDuration += dt
         } else {
             stillDuration = 0.0
         }
 
-        isStationary = stillDuration >= STANDSTILL_MIN_TIME_S
+        // Standstill engages after sustained quiescence AND speed is low or braking has stopped vehicle
+        isStationary = stillDuration >= STANDSTILL_MIN_TIME_S && (forwardSpeed < 1.2 || stillDuration >= 2.5)
 
         if (isStationary) {
             // ZUPT active: zero velocity and calibrate zero-g bias
@@ -299,7 +308,14 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             zuptCount++
             status = "Stationary (ZUPT active)"
         } else {
-            // 6. Non-Holonomic Longitudinal Forward Acceleration & Velocity Propagation
+            // 6. Longitudinal Forward Acceleration & Velocity Propagation
+            if (isStep) {
+                // Pedestrian step impulse (~1.25 m/s cadence)
+                if (forwardSpeed < 1.25) {
+                    forwardSpeed = 1.25
+                }
+            }
+
             val aEffEast = aEast - biasE
             val aEffNorth = aNorth - biasN
 
@@ -309,7 +325,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             forwardSpeed += aFwd * dt
 
             // Natural aerodynamic & rolling damping when coasting
-            if (abs(aFwd) < 0.2) {
+            if (abs(aFwd) < 0.15 && !isStep) {
                 forwardSpeed *= (1.0 - COAST_DRAG_COEFF * dt)
             }
 
@@ -327,10 +343,13 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             ve = forwardSpeed * sinH
             vn = forwardSpeed * cosH
 
-            if (!gpsAvailable) {
-                status = if (autoSnapActive) "GNSS unavailable: inertial + road snap"
-                else if (route.size >= 2) "GNSS unavailable: inertial + route"
-                else "GNSS unavailable: inertial coast"
+            val fresh = isGnssFresh()
+            gpsAvailable = fresh
+            if (!fresh) {
+                status = if (autoSnapActive) "GPS OFF: inertial + road snap"
+                else if (route.size >= 2 && !lateralFailure) "GPS OFF: inertial + route"
+                else if (isStep) "GPS OFF: pedestrian DR (walking)"
+                else "GPS OFF: inertial dead reckoning"
             }
         }
 
@@ -345,7 +364,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             outX = routeMatch.x; outY = routeMatch.y
             outVe = routeMatch.ve; outVn = routeMatch.vn
             routeS = routeMatch.routeS
-        } else if (route.size < 2 && destinationLat == null) {
+        } else {
             val snap = autoSnapToRoad(x, y, forwardSpeed)
             if (snap != null) {
                 outX = snap.x; outY = snap.y
@@ -377,8 +396,8 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         lastDebug = com.sih.idr.navigation.pdr.PdrDebug(
             timestampNanos = sample.timestampNanos,
             accMagnitude = lastAccMag,
-            stepDetected = false,
-            strideLength = Float.NaN,
+            stepDetected = isStep,
+            strideLength = if (isStep) 0.75f else Float.NaN,
             gyroHeadingRad = Math.toRadians(vehicleHeadingDeg.toDouble()).toFloat(),
             magHeadingRad = Float.NaN,
             fusedHeadingRad = Math.toRadians(outHeadingDeg.toDouble()).toFloat(),
@@ -511,13 +530,18 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             val dx = cx - ax; val dy = cy - ay
             val segLen = routeCumDist[i + 1] - routeCumDist[i]
             if (segLen < 1e-6) continue
-            val t = (((rawX - ax) * dx + (rawY - ay) * dy) / (segLen * segLen)).coerceIn(0.0, 1.0)
+            // Fraction along segment line without clamping
+            val tRaw = ((rawX - ax) * dx + (rawY - ay) * dy) / (segLen * segLen)
+            // Only consider it on-segment if within bounds (-5% to 105%)
+            if (tRaw < -0.05 || tRaw > 1.05) continue
+
+            val t = tRaw.coerceIn(0.0, 1.0)
             val qx = ax + t * dx
             val qy = ay + t * dy
             val d = hypot(rawX - qx, rawY - qy)
             val s = routeCumDist[i] + t * segLen
 
-            if (s + 3.0 >= routeS && s <= routeS + ROUTE_LOOKAHEAD_M && d < best) {
+            if (s + 5.0 >= routeS && s <= routeS + ROUTE_LOOKAHEAD_M && d < best) {
                 best = d
                 bx = qx
                 by = qy
@@ -527,25 +551,18 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
                 found = true
             }
         }
-        if (!found) {
+        if (!found || best > 25.0) {
             lateralFailure = true
             return null
         }
-        lateralFailure = best > 30.0
-        if (lateralFailure) return null
+        lateralFailure = false
         val mve = tx * rawSpeed
         val mvn = ty * rawSpeed
         return Matched(bx, by, mve, mvn, bs)
     }
 
     private fun autoSnapToRoad(rawX: Double, rawY: Double, rawSpeed: Double): Matched? {
-        val snapper = roadSnapper
-        if (snapper == null || rawSpeed < AUTO_SNAP_MIN_SPEED) {
-            val held = if (autoHasEdge) projectOntoAutoEdge(rawX, rawY, rawSpeed) else null
-            autoSnapped = held != null
-            autoSnapActive = autoSnapped
-            return held
-        }
+        val snapper = roadSnapper ?: return null
         val moved = hypot(rawX - lastSnapX, rawY - lastSnapY)
         val due = !autoHasEdge || moved > AUTO_SNAP_REQUERY_M ||
             elapsed - lastSnapElapsed > AUTO_SNAP_REQUERY_S
@@ -577,11 +594,22 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
     private fun projectOntoAutoEdge(rawX: Double, rawY: Double, rawSpeed: Double): Matched? {
         val dx = autoBx - autoAx; val dy = autoBy - autoAy
         val l2 = dx * dx + dy * dy
-        if (l2 < 1.0) return null
-        val t = (((rawX - autoAx) * dx + (rawY - autoAy) * dy) / l2).coerceIn(0.0, 1.0)
+        if (l2 < 1.0) {
+            autoHasEdge = false
+            return null
+        }
+        val tRaw = ((rawX - autoAx) * dx + (rawY - autoAy) * dy) / l2
+        if (tRaw < -0.05 || tRaw > 1.05) {
+            autoHasEdge = false
+            return null
+        }
+        val t = tRaw.coerceIn(0.0, 1.0)
         val qx = autoAx + t * dx; val qy = autoAy + t * dy
         val d = hypot(rawX - qx, rawY - qy)
-        if (d > AUTO_SNAP_MAX_DIST_M) return null
+        if (d > AUTO_SNAP_MAX_DIST_M) {
+            autoHasEdge = false
+            return null
+        }
 
         var ux = dx / sqrt(l2); var uy = dy / sqrt(l2)
         val hRad = Math.toRadians(vehicleHeadingDeg.toDouble())
@@ -637,6 +665,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         stillDuration = 0.0
         isStationary = false
         zuptCount = 0L
+        stepCount = 0
         route.clear()
         routeCumDist = DoubleArray(0)
         routeS = 0.0
@@ -671,8 +700,8 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         private const val STANDSTILL_GYRO_MAX = 0.06
         /** Standstill detection linear accel threshold (m/s^2). */
         private const val STANDSTILL_ACC_MAX = 0.35
-        /** Minimum standstill duration to engage ZUPT (seconds). */
-        private const val STANDSTILL_MIN_TIME_S = 0.35
+        /** Minimum standstill duration to engage ZUPT (seconds) - 1.2s prevents cruising false-positives. */
+        private const val STANDSTILL_MIN_TIME_S = 1.2
         /** GNSS gate: jump > K*accuracy + cappedSpeed*dt + MARGIN is rejected. */
         private const val GNSS_GATE_K = 3.0
         private const val GNSS_GATE_MARGIN = 15.0
