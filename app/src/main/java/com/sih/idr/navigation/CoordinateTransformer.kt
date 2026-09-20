@@ -49,14 +49,18 @@ object CoordinateTransformer {
         out[2] = -g * r[8]
     }
 
-    /** Yaw/pitch/roll in degrees from a rotation matrix (same convention as SensorManager). */
     fun yawPitchRollDeg(r: FloatArray): FloatArray {
-        val o = FloatArray(3)
-        SensorManager.getOrientation(r, o)
+        // Pure math: exact equivalence to SensorManager.getOrientation
+        // values[0] (azimuth) = atan2(R[1], R[4])
+        // values[1] (pitch)   = asin(-R[7])
+        // values[2] (roll)    = atan2(-R[6], R[8])
+        val yawRad = kotlin.math.atan2(r[1].toDouble(), r[4].toDouble())
+        val pitchRad = kotlin.math.asin((-r[7]).toDouble().coerceIn(-1.0, 1.0))
+        val rollRad = kotlin.math.atan2((-r[6]).toDouble(), r[8].toDouble())
         return floatArrayOf(
-            GeoUtils.normalizeHeading(Math.toDegrees(o[0].toDouble()).toFloat()),
-            Math.toDegrees(o[1].toDouble()).toFloat(),
-            Math.toDegrees(o[2].toDouble()).toFloat()
+            GeoUtils.normalizeHeading(Math.toDegrees(yawRad).toFloat()),
+            Math.toDegrees(pitchRad).toFloat(),
+            Math.toDegrees(rollRad).toFloat()
         )
     }
 }

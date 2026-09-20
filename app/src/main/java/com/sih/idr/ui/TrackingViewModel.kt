@@ -381,7 +381,7 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         lastDrPointMs = 0L
         if (fix != null) {
             val speed = fix.speed ?: 0f
-            val heading = fix.bearing ?: 0f
+            val heading = fix.bearing ?: orientationManager.currentYawDeg() ?: 0f
             val headingRad = Math.toRadians(heading.toDouble())
             // >>> THE BOUNDARY: after this call the engine sees IMU only
             // (plus onGnssMeasurement forwarding while enabled — ignored by baseline).
@@ -416,8 +416,9 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         } else {
             // No GPS ever seen (e.g. phone location off since boot):
             // run a relative track, clearly labeled as having no absolute position.
+            val startYaw = orientationManager.currentYawDeg() ?: 0f
             engine.initialize(
-                NavigationState(timestampNanos = System.nanoTime(), latitude = 0.0, longitude = 0.0)
+                NavigationState(timestampNanos = System.nanoTime(), latitude = 0.0, longitude = 0.0, headingDeg = startYaw)
             )
             seedInfo.value = "DR seed: NONE — relative track (no absolute position)"
             hasGpsSeed.value = false
@@ -639,7 +640,13 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             stepCount = s?.pdrDebug?.count { it.stepDetected } ?: 0,
             locationOn = isLocationEnabled()
             ,plannedRoute = plannedRouteLatLon.mapIndexed { i, p -> TrajectoryPoint(i.toLong(), p.first, p.second) }
-            ,engineHealth = buildString { append(vehicleEngine.status); if (vehicleEngine.speedFailure) append(" · speed fault"); if (vehicleEngine.lateralFailure) append(" · lateral fault") }
+            ,engineHealth = buildString {
+                append(vehicleEngine.status)
+                if (vehicleEngine.isStationary) append(" · ZUPT active")
+                if (vehicleEngine.mountCalibrated) append(" · mount aligned")
+                if (vehicleEngine.speedFailure) append(" · speed fault")
+                if (vehicleEngine.lateralFailure) append(" · lateral fault")
+            }
         )
     }
 

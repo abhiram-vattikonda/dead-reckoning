@@ -38,4 +38,12 @@ object GeoUtils {
         if (errorM.isNaN()) return Double.NaN
         return errorM / distanceM * 100.0
     }
+
+    /** Smallest signed angular difference (target - current) wrapped to [-180, 180] degrees. */
+    fun angleDiffDeg(targetDeg: Double, currentDeg: Double): Double {
+        var d = (targetDeg - currentDeg) % 360.0
+        if (d > 180.0) d -= 360.0
+        if (d < -180.0) d += 360.0
+        return d
+    }
 }
