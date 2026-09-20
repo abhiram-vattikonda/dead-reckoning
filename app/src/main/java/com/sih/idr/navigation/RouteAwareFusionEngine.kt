@@ -12,9 +12,17 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
     private var lastNanos = -1L
     private var elapsed = 0.0
     private var originLat = 0.0; private var originLon = 0.0
+    // RAW inertial dead-reckoning state. Map matching below only reads this and
+    // produces a separate matched copy for output — it must never overwrite it,
+    // otherwise a stale projection pins the whole trail (GPS-off freeze).
     private var x = 0.0; private var y = 0.0
     private var ve = 0.0; private var vn = 0.0
     private var yaw = 0.0
+    // DR_POSITION_FROZEN detector: tracks the *output* (matched-or-raw) position.
+    private var lastOutX = Double.NaN
+    private var lastOutY = Double.NaN
+    private var lastMoveElapsed = 0.0
+    private var freezeLogged = false
     private var lastAccMag = Float.NaN
     // Low-passed linear accel (IIR) used for integration: hand/scooty
     // vibration rectifies into velocity if integrated raw (freeze fault).
@@ -130,6 +138,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             CoordinateTransformer.transform(a, r, w); ve += w[0] * dt; vn += w[1] * dt
             yaw = atan2(ve, vn)
         }
+        // RAW position ALWAYS advances from IMU, regardless of GPS/route state.
         x += ve * dt; y += vn * dt
         val speed = hypot(ve, vn)
         // FIX 1c (freeze fault): clamp speed to V_MAX preserving direction
@@ -139,16 +148,31 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         speedFailure = !speed.isFinite() || speed > V_MAX
         if (!speed.isFinite()) { ve = 0.0; vn = 0.0; status = "speed failure: bounded" }
         else if (speed > V_MAX) { ve *= V_MAX / speed; vn *= V_MAX / speed; status = "speed clamped: vibration" }
-        constrainToRoute()
-        // Destination-less map matching: same lateral pin as a planned route,
-        // but the segment is discovered from the direction of travel. Only
-        // when no planned route exists (a real route always wins).
-        if (route.size < 2 && destinationLat == null) autoSnapToRoad()
-        val ll = GeoUtils.moveEnu(originLat, originLon, y, x)
+        // Optional map matching on a COPY. Failures/stale candidates return null
+        // and we fall back to the raw DR position — raw x/y/ve/vn are untouched.
+        var outX = x; var outY = y; var outVe = ve; var outVn = vn
+        val routeMatch = constrainToRoute(x, y, ve, vn)
+        if (routeMatch != null) {
+            outX = routeMatch.x; outY = routeMatch.y
+            outVe = routeMatch.ve; outVn = routeMatch.vn
+            routeS = routeMatch.routeS
+        } else if (route.size < 2 && destinationLat == null) {
+            // Destination-less map matching: same lateral pin as a planned route,
+            // but the segment is discovered from the direction of travel. Only
+            // when no planned route exists (a real route always wins).
+            val snap = autoSnapToRoad(x, y, ve, vn)
+            if (snap != null) {
+                outX = snap.x; outY = snap.y
+                outVe = snap.ve; outVn = snap.vn
+            }
+        }
+        yaw = atan2(outVe, outVn)
+        val ll = GeoUtils.moveEnu(originLat, originLon, outY, outX)
         val next = old.copy(timestampNanos = sample.timestampNanos, latitude = ll.first, longitude = ll.second,
-            velEast = ve.toFloat(), velNorth = vn.toFloat(), headingDeg = GeoUtils.normalizeHeading(Math.toDegrees(atan2(ve, vn)).toFloat()),
+            velEast = outVe.toFloat(), velNorth = outVn.toFloat(), headingDeg = GeoUtils.normalizeHeading(Math.toDegrees(atan2(outVe, outVn)).toFloat()),
             confidenceMeters = (2.0 + elapsed * if (gpsAvailable) 0.05 else 1.0).toFloat())
         state = next; if (!gpsAvailable && !speedFailure) status = if (autoSnapActive) "GNSS unavailable: inertial + road snap" else "GNSS unavailable: inertial + route"
+        checkFrozen(outX, outY)
         // Engine-agnostic debug snapshot (no step model here: step/stride/mag stay NaN/false).
         lastDebug = com.sih.idr.navigation.pdr.PdrDebug(
             timestampNanos = sample.timestampNanos,
@@ -158,8 +182,8 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             gyroHeadingRad = yaw.toFloat(),
             magHeadingRad = Float.NaN,
             fusedHeadingRad = yaw.toFloat(),
-            xEast = x.toFloat(),
-            yNorth = y.toFloat(),
+            xEast = outX.toFloat(),
+            yNorth = outY.toFloat(),
             latitude = ll.first,
             longitude = ll.second
         )
@@ -210,17 +234,52 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         status = "GNSS fused: route constrained"
     }
 
-    private fun constrainToRoute() {
-        if (route.size < 2) return
-        var best = Double.POSITIVE_INFINITY; var bx = x; var by = y; var bs = routeS; var tx = 1.0; var ty = 0.0
+    /** Matched copy derived from raw; null = no valid candidate, use raw. */
+    private data class Matched(val x: Double, val y: Double, val ve: Double, val vn: Double, val routeS: Double = 0.0)
+
+    /** True when a GNSS fix arrived recently; false = IMU-only mode. */
+    private fun isGnssFresh(nowMs: Long = System.currentTimeMillis()): Boolean {
+        if (lastGnssMillis < 0) return false
+        return (nowMs - lastGnssMillis) < 8000L
+    }
+
+    /** Logs DR_POSITION_FROZEN when output is stagnant with no GPS but motion. */
+    private fun checkFrozen(outX: Double, outY: Double) {
+        if (lastOutX.isNaN() || lastOutY.isNaN()) {
+            lastOutX = outX; lastOutY = outY; lastMoveElapsed = elapsed; freezeLogged = false
+            return
+        }
+        if (hypot(outX - lastOutX, outY - lastOutY) > 0.5) {
+            lastOutX = outX; lastOutY = outY; lastMoveElapsed = elapsed; freezeLogged = false
+            return
+        }
+        val stagnantS = elapsed - lastMoveElapsed
+        if (!freezeLogged && stagnantS > 30.0 && !isGnssFresh() && hypot(ve, vn) > 1.0) {
+            freezeLogged = true
+            android.util.Log.w(
+                "RouteAwareFusionEngine",
+                "DR_POSITION_FROZEN gpsUnavailable velocity=%.2f stagnant=%.0fs out=(%.1f,%.1f) raw=(%.1f,%.1f)".format(
+                    hypot(ve, vn), stagnantS, outX, outY, x, y
+                )
+            )
+        }
+    }
+
+    private fun constrainToRoute(rawX: Double, rawY: Double, rawVe: Double, rawVn: Double): Matched? {
+        if (route.size < 2) return null
+        var best = Double.POSITIVE_INFINITY; var bx = rawX; var by = rawY; var bs = routeS; var tx = 1.0; var ty = 0.0
+        var found = false
         // FIX 3a (snap trap): search only near current route progress. The old
         // full-route forward-only search could latch onto a far-ahead segment
         // where a looping road passes nearby, then monotonic routeS could never
         // come back: position pinned to one vertex while riding. Window keeps
         // legitimate per-step progress (cm-scale) free and blocks km jumps.
-        for (i in 0 until route.size - 1) { val (ax, ay) = route[i]; val (cx, cy) = route[i + 1]; val dx = cx - ax; val dy = cy - ay; val l2 = dx * dx + dy * dy; if (l2 == 0.0) continue; val t = (((x - ax) * dx + (y - ay) * dy) / l2).coerceIn(0.0, 1.0); val qx = ax + t * dx; val qy = ay + t * dy; val d = hypot(x - qx, y - qy); val s = i * sqrt(l2) + t * sqrt(l2); if (s + 3 >= routeS && s <= routeS + ROUTE_LOOKAHEAD_M && d < best) { best = d; bx = qx; by = qy; bs = s; tx = dx / sqrt(l2); ty = dy / sqrt(l2) } }
+        for (i in 0 until route.size - 1) { val (ax, ay) = route[i]; val (cx, cy) = route[i + 1]; val dx = cx - ax; val dy = cy - ay; val l2 = dx * dx + dy * dy; if (l2 == 0.0) continue; val t = (((rawX - ax) * dx + (rawY - ay) * dy) / l2).coerceIn(0.0, 1.0); val qx = ax + t * dx; val qy = ay + t * dy; val d = hypot(rawX - qx, rawY - qy); val s = i * sqrt(l2) + t * sqrt(l2); if (s + 3 >= routeS && s <= routeS + ROUTE_LOOKAHEAD_M && d < best) { best = d; bx = qx; by = qy; bs = s; tx = dx / sqrt(l2); ty = dy / sqrt(l2); found = true } }
+        if (!found) { lateralFailure = true; return null }
         lateralFailure = best > 30.0
-        if (!lateralFailure) { x = bx; y = by; routeS = bs; val sp = hypot(ve, vn); ve = tx * sp; vn = ty * sp }
+        if (lateralFailure) return null
+        val sp = hypot(rawVe, rawVn); val mve = tx * sp; val mvn = ty * sp
+        return Matched(bx, by, mve, mvn, bs)
     }
 
     /**
@@ -231,24 +290,25 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
      * Anything unresolved (no graph coverage, too far from any road,
      * near-standstill) degrades to free coast, never a pin.
      */
-    private fun autoSnapToRoad() {
+    private fun autoSnapToRoad(rawX: Double, rawY: Double, rawVe: Double, rawVn: Double): Matched? {
         val snapper = roadSnapper
-        val sp = hypot(ve, vn)
+        val sp = hypot(rawVe, rawVn)
         if (snapper == null || sp < AUTO_SNAP_MIN_SPEED) {
             // Standstill: hold the last pin (if any) without re-querying, so
             // hand jitter at traffic lights cannot flicker between roads.
-            if (autoHasEdge) projectOntoAutoEdge()
-            else autoSnapped = false
+            val held = if (autoHasEdge) projectOntoAutoEdge(rawX, rawY, rawVe, rawVn) else null
+            autoSnapped = held != null
             autoSnapActive = autoSnapped
-            return
+            return held
         }
-        val moved = hypot(x - lastSnapX, y - lastSnapY)
+        // Re-query is driven by RAW movement so a stale pin can never block it.
+        val moved = hypot(rawX - lastSnapX, rawY - lastSnapY)
         val due = !autoHasEdge || moved > AUTO_SNAP_REQUERY_M ||
             elapsed - lastSnapElapsed > AUTO_SNAP_REQUERY_S
         if (due) {
-            lastSnapX = x; lastSnapY = y; lastSnapElapsed = elapsed
-            lastSnapHeading = GeoUtils.normalizeHeading(Math.toDegrees(atan2(ve, vn)).toFloat())
-            val (lat, lon) = enuToLatLon(x, y)
+            lastSnapX = rawX; lastSnapY = rawY; lastSnapElapsed = elapsed
+            lastSnapHeading = GeoUtils.normalizeHeading(Math.toDegrees(atan2(rawVe, rawVn)).toFloat())
+            val (lat, lon) = enuToLatLon(rawX, rawY)
             val snap = try {
                 snapper.snap(lat, lon, lastSnapHeading)
             } catch (_: Exception) { null }
@@ -265,27 +325,27 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
                 autoHasEdge = false
             }
         }
-        if (autoHasEdge) projectOntoAutoEdge() else autoSnapped = false
+        val matched = if (autoHasEdge) projectOntoAutoEdge(rawX, rawY, rawVe, rawVn) else null
+        autoSnapped = matched != null
         autoSnapActive = autoSnapped
+        return matched
     }
 
     /** Pin onto the stored auto edge; velocity follows the road direction. */
-    private fun projectOntoAutoEdge() {
+    private fun projectOntoAutoEdge(rawX: Double, rawY: Double, rawVe: Double, rawVn: Double): Matched? {
         val dx = autoBx - autoAx; val dy = autoBy - autoAy
         val l2 = dx * dx + dy * dy
-        if (l2 < 1.0) { autoSnapped = false; return }
-        val t = (((x - autoAx) * dx + (y - autoAy) * dy) / l2).coerceIn(0.0, 1.0)
+        if (l2 < 1.0) { return null }
+        val t = (((rawX - autoAx) * dx + (rawY - autoAy) * dy) / l2).coerceIn(0.0, 1.0)
         val qx = autoAx + t * dx; val qy = autoAy + t * dy
-        val d = hypot(x - qx, y - qy)
-        if (d > AUTO_SNAP_MAX_DIST_M) { autoSnapped = false; return }
-        x = qx; y = qy
+        val d = hypot(rawX - qx, rawY - qy)
+        if (d > AUTO_SNAP_MAX_DIST_M) { return null }
         // Follow the road either way: keep the travel direction, not the edge
         // orientation (roads are undirected for matching purposes).
         var ux = dx / sqrt(l2); var uy = dy / sqrt(l2)
-        if (ux * ve + uy * vn < 0) { ux = -ux; uy = -uy }
-        val sp = hypot(ve, vn)
-        ve = ux * sp; vn = uy * sp
-        autoSnapped = true
+        if (ux * rawVe + uy * rawVn < 0) { ux = -ux; uy = -uy }
+        val sp = hypot(rawVe, rawVn)
+        return Matched(qx, qy, ux * sp, uy * sp)
     }
 
     private fun enuToLatLon(e: Double, n: Double): Pair<Double, Double> {
@@ -313,7 +373,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         }
         return bs
     }
-    override fun reset() { state = null; lastNanos = -1L; elapsed = 0.0; x = 0.0; y = 0.0; ve = 0.0; vn = 0.0; route.clear(); routeS = 0.0; gpsAvailable = false; speedFailure = false; lateralFailure = false; status = "waiting for GNSS"; lastAccMag = Float.NaN; lastDebug = null; lpAx = 0.0; lpAy = 0.0; lpInit = false; lastGnssMillis = -1L; gnssRejectStreak = 0; gnssRejects = 0; autoHasEdge = false; autoSnapped = false; autoSnapActive = false; lastSnapElapsed = -1.0 }
+    override fun reset() { state = null; lastNanos = -1L; elapsed = 0.0; x = 0.0; y = 0.0; ve = 0.0; vn = 0.0; route.clear(); routeS = 0.0; gpsAvailable = false; speedFailure = false; lateralFailure = false; status = "waiting for GNSS"; lastAccMag = Float.NaN; lastDebug = null; lpAx = 0.0; lpAy = 0.0; lpInit = false; lastGnssMillis = -1L; gnssRejectStreak = 0; gnssRejects = 0; autoHasEdge = false; autoSnapped = false; autoSnapActive = false; lastSnapX = 0.0; lastSnapY = 0.0; lastSnapElapsed = -1.0; lastOutX = Double.NaN; lastOutY = Double.NaN; lastMoveElapsed = 0.0; freezeLogged = false }
 
     companion object {
         /** IIR low-pass alpha on linear accel before integration (~4 Hz @100 Hz). */
