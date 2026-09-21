@@ -46,4 +46,31 @@ object GeoUtils {
         if (d < -180.0) d += 360.0
         return d
     }
+
+    /**
+     * Geodetic (lat/lon) → local ENU meters around ([refLat],[refLon]).
+     * Equirectangular approximation — accurate at road-segment scale; single
+     * canonical helper so engines, tests and map matching share one frame.
+     */
+    fun latLonToEnu(lat: Double, lon: Double, refLat: Double, refLon: Double): Pair<Double, Double> {
+        val e = Math.toRadians(lon - refLon) * EARTH_RADIUS_M * cos(Math.toRadians(refLat))
+        val n = Math.toRadians(lat - refLat) * EARTH_RADIUS_M
+        return e to n
+    }
+
+    /**
+     * Verbose alias kept for test/call-site readability: geodetic (+alt, ignored
+     * at road scale) → ENU around the reference fix.
+     */
+    fun geodeticToEnu(
+        lat: Double, lon: Double, @Suppress("UNUSED_PARAMETER") alt: Double,
+        refLat: Double, refLon: Double, @Suppress("UNUSED_PARAMETER") refAlt: Double
+    ): EnuPoint = latLonToEnu(lat, lon, refLat, refLon).let { EnuPoint(it.first, it.second) }
+
+    /** Compass bearing of the ENU direction (east, north): 0 = North, clockwise. */
+    fun bearingFromEnu(east: Double, north: Double): Double =
+        (Math.toDegrees(atan2(east, north)) + 360.0) % 360.0
 }
+
+/** Local ENU point in meters (x = East, y = North) around a reference fix. */
+data class EnuPoint(val x: Double, val y: Double)

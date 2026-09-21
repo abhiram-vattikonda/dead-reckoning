@@ -121,7 +121,8 @@ object CsvExporter {
         pdrCsv.bufferedWriter().use { w ->
             w.write("timestamp_nanos,acc_mag,step_detected,stride_length," +
                 "gyro_heading_rad,mag_heading_rad,fused_heading_rad," +
-                "dr_x_east,dr_y_north,dr_lat,dr_lon\n")
+                "dr_x_east,dr_y_north,dr_lat,dr_lon," +
+                "forward_speed_mps,yaw_rate_deg_s,lateral_vel_mps,snap_mode\n")
             for (d in pdrDebug) {
                 w.write(listOf(
                     d.timestampNanos.toString(),
@@ -134,7 +135,11 @@ object CsvExporter {
                     d.xEast.toString(),
                     d.yNorth.toString(),
                     d.latitude.toString(),
-                    d.longitude.toString()
+                    d.longitude.toString(),
+                    d.forwardSpeedMps.toString(),
+                    d.yawRateDegS.toString(),
+                    d.lateralVelMps.toString(),
+                    d.snapMode
                 ).joinToString(",") + "\n")
             }
         }

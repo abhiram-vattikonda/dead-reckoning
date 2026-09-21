@@ -144,8 +144,12 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
 
     private var session: TestSession? = null
     private var lastUiPushMs = 0L
-    private var lastDrPointMs = 0L
-    private var lastPdrLogMs = 0L
+    // Consistent logging grid: BOTH the DR trajectory and the pdrDebug buffer are
+    // decimated on the SAME sensor-timestamp clock (100 ms of sensor time ≈ 10 Hz),
+    // so nav/pdr/imu rows stay joinable on timestamps in Python. Wall-clock time is
+    // used ONLY for UI throttling, never for log decimation.
+    private var lastDrPointSensorMs = Long.MIN_VALUE
+    private var lastPdrLogSensorMs = Long.MIN_VALUE
     private var destination: Pair<Double, Double>? = null
     private var plannedRouteLatLon: List<Pair<Double, Double>> = emptyList()
     private val offRouteDetector = OffRouteDetector()
@@ -154,6 +158,14 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         /** DR-only route rebuilds above this uncertainty do more harm than good (relaxed for GPS outage). */
         private const val DR_RECALC_MAX_CONF_M = 200f
+        /** Sensor-time decimation for trajectory + debug buffers (≈10 Hz on one grid). */
+        private const val LOG_DECIM_SENSOR_MS = 100L
+        // Bounded buffers: high-rate lists are chunk-trimmed so a long drive cannot
+        // OOM the app; decimated trajectories are small enough to keep whole.
+        private const val MAX_IMU_SAMPLES = 300_000
+        private const val MAX_DR_STATES = 300_000
+        private const val MAX_PDR_DEBUG = 60_000
+        private const val TRIM_CHUNK = 30_000
     }
 
     init {
@@ -409,7 +421,8 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
     private fun enableNavEngine() {
         val fix = gpsManager.lastFix.value ?: getCachedLocationFix()
         engine.reset()
-        lastDrPointMs = 0L
+        lastDrPointSensorMs = Long.MIN_VALUE
+        lastPdrLogSensorMs = Long.MIN_VALUE
         if (fix != null) {
             val speed = fix.speed ?: 0f
             val heading = fix.bearing ?: orientationManager.currentYawDeg() ?: 0f
@@ -535,8 +548,8 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         onStop()
         engine.reset()
         session = null
-        lastDrPointMs = 0L
-        lastPdrLogMs = 0L
+        lastDrPointSensorMs = Long.MIN_VALUE
+        lastPdrLogSensorMs = Long.MIN_VALUE
         offRouteDetector.reset()
         recalculating = false
         recalcInfo.value = ""
@@ -598,6 +611,9 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         if (!_isRecording.value) return
         val s = session ?: return
         s.imuSamples.add(sample) // IMU always logged during a session
+        if (s.imuSamples.size > MAX_IMU_SAMPLES) {
+            repeat(TRIM_CHUNK) { s.imuSamples.removeAt(0) }
+        }
         if (!navEngineEnabled.value) {
             // Navigation engine off: no DR processing at all.
             val wall = System.currentTimeMillis()
@@ -606,18 +622,31 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         }
         val nav = engine.processImu(sample)
         s.drStates.add(nav)
-        // Engine intermediates: every step + ~10 Hz track (for CSV/ML debugging).
+        if (s.drStates.size > MAX_DR_STATES) {
+            repeat(TRIM_CHUNK) { s.drStates.removeAt(0) }
+        }
+        // Engine intermediates on the shared sensor-time grid: every step
+        // (event row) plus the 10 Hz track row — via EngineDebugReporter so ANY
+        // active engine is logged with the same buffer discipline.
         // Via the EngineDebugReporter interface so ANY active engine is logged.
         (engine as? EngineDebugReporter)?.lastDebug?.let { dbg ->
-            val nowMsDbg = System.currentTimeMillis()
-            if (dbg.stepDetected || nowMsDbg - lastPdrLogMs >= 100L) {
-                lastPdrLogMs = nowMsDbg
+            val sensorMs = sample.timestampNanos / 1_000_000
+            val due = dbg.stepDetected ||
+                lastPdrLogSensorMs == Long.MIN_VALUE ||
+                sensorMs - lastPdrLogSensorMs >= LOG_DECIM_SENSOR_MS
+            if (due) {
+                lastPdrLogSensorMs = sensorMs
                 s.pdrDebug.add(dbg)
+                if (s.pdrDebug.size > MAX_PDR_DEBUG) {
+                    repeat(TRIM_CHUNK) { s.pdrDebug.removeAt(0) }
+                }
             }
         }
-        val nowMs = sample.timestampNanos / 1_000_000
-        if (nowMs - lastDrPointMs >= 100L) { // 10 Hz nav output decimation
-            lastDrPointMs = nowMs
+        val sensorMs = sample.timestampNanos / 1_000_000
+        if (lastDrPointSensorMs == Long.MIN_VALUE ||
+            sensorMs - lastDrPointSensorMs >= LOG_DECIM_SENSOR_MS
+        ) { // 10 Hz nav output decimation on the same sensor grid
+            lastDrPointSensorMs = sensorMs
             s.drTrajectory.add(TrajectoryPoint(System.currentTimeMillis(), nav.latitude, nav.longitude))
         }
         maybeCheckRoute() // off-route detection runs on the DR (IMU) stream: no GPS needed
@@ -684,7 +713,9 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             ,plannedRoute = plannedRouteLatLon.mapIndexed { i, p -> TrajectoryPoint(i.toLong(), p.first, p.second) }
             ,engineHealth = buildString {
                 append(vehicleEngine.status)
+                append(" · snap=" + vehicleEngine.snapMode)
                 if (vehicleEngine.isStationary) append(" · ZUPT active")
+                if (vehicleEngine.trailSnapActive) append(" · trail×" + vehicleEngine.trailSize)
                 if (vehicleEngine.mountCalibrated) append(" · mount aligned")
                 if (vehicleEngine.speedFailure) append(" · speed fault")
                 if (vehicleEngine.lateralFailure) append(" · lateral fault")

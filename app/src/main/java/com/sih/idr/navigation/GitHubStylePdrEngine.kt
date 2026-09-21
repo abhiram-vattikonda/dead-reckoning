@@ -201,7 +201,11 @@ class GitHubStylePdrEngine(
             xEast = xEast.toFloat(),
             yNorth = yNorth.toFloat(),
             latitude = lat,
-            longitude = lon
+            longitude = lon,
+            forwardSpeedMps = Float.NaN,
+            yawRateDegS = Float.NaN,
+            lateralVelMps = Float.NaN,
+            snapMode = "PDR"
         )
         return next
     }

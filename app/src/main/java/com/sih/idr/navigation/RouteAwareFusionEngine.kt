@@ -10,14 +10,22 @@ import kotlin.math.*
  * State-of-the-art vehicle dead reckoning fusion engine:
  * 1. Full 3D attitude rotation: rotates all 3 linear acceleration axes (including Z)
  *    into world ENU frame so tilted phone mounts do not corrupt horizontal acceleration.
- * 2. Direct IMU orientation heading tracking: decouples vehicle yaw from noisy integrated
- *    velocity vectors, using the device gyroscope/rotation vector with automatic mount calibration.
+ * 2. Fused heading tracking: rotation-vector device yaw (+ auto mount calibration)
+ *    + gyro-propagated yaw (continuity across rotation-vector jumps) + filtered
+ *    major-velocity-vector heading (slow correction toward the actual path when
+ *    moving straight). Rate-limited so jitter never snaps the trail.
  * 3. Zero Velocity Updates (ZUPT): monitors standstill intervals to reset velocity to zero and
  *    cancel accelerometer bias, arresting the primary cause of explosive drift at traffic stops.
- * 4. Non-holonomic vehicle motion constraints: projects acceleration along travel heading and
- *    suppresses orthogonal lateral velocity drift.
- * 5. Exact cumulative arc-length route constraint: computes true metric progress along routes
- *    with variable segment lengths, eliminating lookahead window lock-ups.
+ * 4. True non-holonomic vehicle constraints with turn-aware lateral handling: the
+ *    2D velocity is decomposed into forward/lateral relative to travel heading;
+ *    expected centripetal acceleration (v * yawRate) is subtracted before lateral
+ *    integration, lateral velocity is heavily damped (more in turns), and small
+ *    residual sideways velocities are dead-banded to zero — this is what stops
+ *    turn inertia from flinging the trail sideways.
+ * 5. Exact cumulative arc-length route constraint + breadcrumb trail memory +
+ *    destination-less road snap, in that priority order. The trail memory lets a
+ *    U-turn / backtrack re-snap onto the already-driven path (either direction)
+ *    when the road graph has no edge there.
  */
 class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
     private var state: NavigationState? = null
@@ -31,12 +39,32 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
     private var y = 0.0
     var forwardSpeed = 0.0
         private set
+    /** Signed lateral (right-positive) velocity after NHC damping (m/s). */
+    var lateralVel = 0.0
+        private set
     private var ve = 0.0
     private var vn = 0.0
 
-    // Heading state in degrees clockwise from North [0, 360).
+    // ---- Filtered major velocity vector (dominant direction of travel) ----
+    private var filtVe = 0.0
+    private var filtVn = 0.0
+    private var filtInit = false
+    /** Slow, stable dominant-path heading, steered only when moving straight. */
+    var dominantHeadingDeg = 0f
+        private set
+    private var dominantInit = false
+
+    // ---- Heading fusion state (degrees clockwise from North) ----
     var vehicleHeadingDeg = 0f
         private set
+    /** Gyro-propagated yaw: continuity across rotation-vector jumps. */
+    private var gyroHeadingDeg = 0f
+    private var gyroHeadingInit = false
+    private var lastDeviceYawDeg: Double? = null
+    /** Filtered yaw rate, deg/s, +clockwise. */
+    var yawRateDegS = 0.0
+        private set
+    private var lpGyroMag = 0.0
 
     // Mount alignment: angular offset between device azimuth and vehicle travel heading.
     var mountOffsetDeg = 0.0
@@ -94,6 +122,35 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
     /** True while laterally pinned to an auto-discovered road segment. */
     var autoSnapActive = false
         private set
+
+    // ---- Breadcrumb trail memory (own driven path) ----
+    private val trailE = ArrayDeque<Double>()
+    private val trailN = ArrayDeque<Double>()
+    private val trailH = ArrayDeque<Float>()
+    private var lastTrailX = Double.NaN
+    private var lastTrailY = Double.NaN
+    // Cached trail edge for cheap per-sample projection.
+    private var trAx = 0.0
+    private var trAy = 0.0
+    private var trBx = 0.0
+    private var trBy = 0.0
+    private var trHasEdge = false
+    private var trReversed = false
+    private var lastTrailQueryX = 0.0
+    private var lastTrailQueryY = 0.0
+    private var lastTrailQueryElapsed = -1.0
+    /** True while pinned to the remembered driven path. */
+    var trailSnapActive = false
+        private set
+    /** Which constraint produced the current output (for logging/UI). */
+    var snapMode = "FREE"
+        private set
+    val trailSize: Int get() = trailE.size
+    // Recent raw-position buffer for the resemblance gate (decimated ~5 Hz).
+    private val recentRawE = ArrayDeque<Double>()
+    private val recentRawN = ArrayDeque<Double>()
+    private var lastRecentX = Double.NaN
+    private var lastRecentY = Double.NaN
 
     override var lastDebug: com.sih.idr.navigation.pdr.PdrDebug? = null
         private set
@@ -201,9 +258,16 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         originLon = initialState.longitude
         forwardSpeed = initialState.speed.toDouble()
         vehicleHeadingDeg = initialState.headingDeg
+        gyroHeadingDeg = initialState.headingDeg
+        gyroHeadingInit = true
+        dominantHeadingDeg = initialState.headingDeg
+        dominantInit = true
         val hRad = Math.toRadians(initialState.headingDeg.toDouble())
         ve = forwardSpeed * sin(hRad)
         vn = forwardSpeed * cos(hRad)
+        filtVe = ve
+        filtVn = vn
+        filtInit = true
         status = "GNSS anchor acquired"
         pendingRouteLatLon?.let { applyRouteLatLon(it) } ?: rebuildRoute()
     }
@@ -234,7 +298,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             } else {
                 ax = sample.accelX.toDouble()
                 ay = sample.accelY.toDouble()
-                az = (sample.accelZ - 9.80665).toDouble()
+                az = (sample.accelZ - 9.80665f).toDouble()
             }
         }
 
@@ -257,16 +321,61 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             fax *= s; fay *= s; faz *= s
         }
 
-        // 3. Orientation & Vehicle Heading from Gyro/Rotation-Vector
+        // 3. Heading fusion: device yaw + gyro propagation + velocity-vector correction.
+        // 3a. Device yaw from the rotation vector (absolute, mount-offset corrected).
+        var deviceYawDeg: Double? = null
         if (rotM != null) {
             val ypr = CoordinateTransformer.yawPitchRollDeg(rotM)
-            val deviceYaw = ypr[0].toDouble()
-            vehicleHeadingDeg = GeoUtils.normalizeHeading((deviceYaw + mountOffsetDeg).toFloat())
+            deviceYawDeg = ypr[0].toDouble()
         }
-
-        val yawRad = Math.toRadians(vehicleHeadingDeg.toDouble())
-        val cosH = cos(yawRad)
-        val sinH = sin(yawRad)
+        // 3b. Filtered gyro magnitude (turn-energy gate when rotM is absent).
+        val gyroMag = sqrt(
+            sample.gyroX * sample.gyroX + sample.gyroY * sample.gyroY + sample.gyroZ * sample.gyroZ
+        ).toDouble()
+        lpGyroMag += GYRO_LP_ALPHA * (gyroMag - lpGyroMag)
+        // 3c. Yaw rate from rotation-vector deltas (OS gyro-fused, mount-independent
+        // in the delta domain); decays to zero when the attitude is unavailable.
+        if (deviceYawDeg != null) {
+            if (!gyroHeadingInit) {
+                gyroHeadingDeg = GeoUtils.normalizeHeading((deviceYawDeg + mountOffsetDeg).toFloat())
+                gyroHeadingInit = true
+                lastDeviceYawDeg = deviceYawDeg
+                yawRateDegS = 0.0
+            } else {
+                val prev = lastDeviceYawDeg
+                if (prev != null && dt > 0.0) {
+                    val delta = GeoUtils.angleDiffDeg(deviceYawDeg, prev)
+                    val instRate = delta / dt
+                    // Clamp unphysical jumps (> 180 deg/s) before they poison the filter.
+                    val clamped = instRate.coerceIn(-180.0, 180.0)
+                    yawRateDegS += YAW_RATE_ALPHA * (clamped - yawRateDegS)
+                    // Propagate the gyro heading with the same (clamped) delta so it
+                    // rides through rotation-vector dropouts without jumping.
+                    val step = clamped * dt
+                    gyroHeadingDeg = GeoUtils.normalizeHeading((gyroHeadingDeg + step).toFloat())
+                }
+                lastDeviceYawDeg = deviceYawDeg
+            }
+        } else {
+            yawRateDegS *= (1.0 - YAW_RATE_ALPHA)
+            if (lpGyroMag > TURN_GYRO_MAG_RAD_S) {
+                // Attitude unknown but the gyro sees rotation: hold heading, flag turn
+                // energy so lateral integration stays suppressed (see §6).
+                yawRateDegS = yawRateDegS.coerceIn(-40.0, 40.0)
+            }
+        }
+        // 3d. Base heading: absolute device yaw when available, else gyro coast.
+        var fusedHeading = if (deviceYawDeg != null) {
+            GeoUtils.normalizeHeading((deviceYawDeg + mountOffsetDeg).toFloat())
+        } else {
+            gyroHeadingDeg
+        }
+        // Blend the gyro-propagated yaw toward the absolute yaw so neither can run
+        // away: gyro carries high-frequency turns, device yaw anchors drift.
+        if (deviceYawDeg != null && gyroHeadingInit) {
+            val drift = GeoUtils.angleDiffDeg(fusedHeading.toDouble(), gyroHeadingDeg.toDouble())
+            gyroHeadingDeg = GeoUtils.normalizeHeading((gyroHeadingDeg + GYRO_ANCHOR_W * drift).toFloat())
+        }
 
         // 4. Transform 3D linear acceleration to world frame (ENU)
         var aEast = 0.0
@@ -278,8 +387,9 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
             aEast = aWorld[0].toDouble()
             aNorth = aWorld[1].toDouble()
         } else {
-            aEast = fax * sinH + fay * cosH
-            aNorth = -fax * cosH + fay * sinH
+            val yawRadTmp = Math.toRadians(fusedHeading.toDouble())
+            aEast = fax * sin(yawRadTmp) + fay * cos(yawRadTmp)
+            aNorth = -fax * cos(yawRadTmp) + fay * sin(yawRadTmp)
         }
 
         // 5. Motion Classification: Step Detection & Standstill (ZUPT)
@@ -298,55 +408,145 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         // Standstill engages after sustained quiescence AND speed is low or braking has stopped vehicle
         isStationary = stillDuration >= STANDSTILL_MIN_TIME_S && (forwardSpeed < 1.2 || stillDuration >= 2.5)
 
+        // Decode current heading unit vectors for the NHC decomposition.
+        var yawRad = Math.toRadians(fusedHeading.toDouble())
+        var sinH = sin(yawRad)
+        var cosH = cos(yawRad)
+
         if (isStationary) {
             // ZUPT active: zero velocity and calibrate zero-g bias
             forwardSpeed = 0.0
+            lateralVel = 0.0
             ve = 0.0
             vn = 0.0
+            filtVe = 0.0
+            filtVn = 0.0
             biasE += 0.05 * (aEast - biasE)
             biasN += 0.05 * (aNorth - biasN)
             zuptCount++
             status = "Stationary (ZUPT active)"
+            vehicleHeadingDeg = fusedHeading
         } else {
-            // 6. Longitudinal Forward Acceleration & Velocity Propagation
+            // 6. True NHC: integrate 2D velocity, then split forward/lateral and
+            //    damp the lateral channel with turn-aware compensation.
             if (isStep) {
                 // Pedestrian step impulse (~1.25 m/s cadence)
-                if (forwardSpeed < 1.25) {
-                    forwardSpeed = 1.25
+                val vFwdNow = ve * sinH + vn * cosH
+                if (vFwdNow < 1.25) {
+                    val boost = 1.25 - vFwdNow
+                    ve += sinH * boost
+                    vn += cosH * boost
                 }
             }
 
             val aEffEast = aEast - biasE
             val aEffNorth = aNorth - biasN
 
-            // Longitudinal acceleration along travel heading
-            val aFwd = (aEffEast * sinH + aEffNorth * cosH).coerceIn(-ACC_BRAKE_MAX, ACC_FWD_MAX)
+            // Raw strapdown integration first (keeps the filter honest)…
+            var vE = ve + aEffEast * dt
+            var vN = vn + aEffNorth * dt
 
-            forwardSpeed += aFwd * dt
+            // …then decompose relative to travel heading.
+            var vFwd = vE * sinH + vN * cosH
+            var vLat = vE * cosH - vN * sinH // right-positive
+            val aFwdRaw = (aEffEast * sinH + aEffNorth * cosH).coerceIn(-ACC_BRAKE_MAX, ACC_FWD_MAX)
+            val aLatRaw = aEffEast * cosH - aEffNorth * sinH
 
-            // Natural aerodynamic & rolling damping when coasting
-            if (abs(aFwd) < 0.15 && !isStep) {
-                forwardSpeed *= (1.0 - COAST_DRAG_COEFF * dt)
+            // Turn compensation: the lateral accelerometer mostly sees centripetal
+            // acceleration (v * yawRate) in a turn — that is NOT a lane change.
+            // Subtract the expected value and only integrate the residual.
+            val yawRateRad = Math.toRadians(yawRateDegS)
+            val turning = abs(yawRateDegS) > TURN_YAW_RATE_DEG_S || lpGyroMag > TURN_GYRO_MAG_RAD_S
+            val aLatExpected = vFwd * yawRateRad
+            var aLatResidual = aLatRaw - aLatExpected
+            if (turning) aLatResidual *= TURN_LAT_SUPPRESS
+            // Rebuild lateral velocity from the damped prior + suppressed residual
+            // instead of the raw strapdown value, so turn inertia cannot fling it.
+            val latDamp = LAT_BASE_DAMP + abs(yawRateRad) * LAT_TURN_GAIN
+            vLat = lateralVel * exp(-latDamp * dt) + aLatResidual * dt
+            // Deadband: ignore slight sideways creep while going straight — the car
+            // is not sliding, the MEMS is.
+            if (!turning && abs(vLat) < LAT_DEADBAND_MPS) vLat = 0.0
+            vLat = vLat.coerceIn(-LAT_MAX_MPS, LAT_MAX_MPS)
+
+            // Longitudinal channel: the strapdown mix above already carries aFwd*dt;
+            // here we only enforce bounds + coast drag (no double integration).
+            if (abs(aFwdRaw) < 0.15 && !isStep) {
+                vFwd *= (1.0 - COAST_DRAG_COEFF * dt)
             }
+            vFwd = vFwd.coerceIn(0.0, V_MAX)
 
-            speedFailure = !forwardSpeed.isFinite() || forwardSpeed > V_MAX
-            if (!forwardSpeed.isFinite()) {
-                forwardSpeed = 0.0
+            speedFailure = !vFwd.isFinite() || vFwd > V_MAX
+            if (!vFwd.isFinite()) {
+                vFwd = 0.0
                 status = "speed failure: bounded"
-            } else if (forwardSpeed > V_MAX) {
-                forwardSpeed = V_MAX
+            } else if (vFwd >= V_MAX) {
+                vFwd = V_MAX
                 status = "speed clamped: bound"
             }
 
-            forwardSpeed = forwardSpeed.coerceAtLeast(0.0)
+            forwardSpeed = vFwd
+            lateralVel = vLat
+            ve = sinH * vFwd + cosH * vLat
+            vn = cosH * vFwd - sinH * vLat
 
-            ve = forwardSpeed * sinH
-            vn = forwardSpeed * cosH
+            // 6b. Major velocity-vector filter (EMA, ~0.4 s) + dominant-path latch.
+            val velAlpha = (dt / (VEL_FILTER_TAU_S + dt)).coerceIn(0.0, 1.0)
+            if (!filtInit) {
+                filtVe = ve; filtVn = vn; filtInit = true
+            } else {
+                filtVe += velAlpha * (ve - filtVe)
+                filtVn += velAlpha * (vn - filtVn)
+            }
+            val filtSpeed = hypot(filtVe, filtVn)
+            if (filtSpeed > VEL_HEADING_MIN_SPEED) {
+                val velHeading = GeoUtils.normalizeHeading(
+                    Math.toDegrees(atan2(filtVe, filtVn)).toFloat()
+                )
+                if (!dominantInit) {
+                    dominantHeadingDeg = velHeading
+                    dominantInit = true
+                } else if (!turning && filtSpeed > DOMINANT_MIN_SPEED) {
+                    // Steer the dominant vector toward the actual path of travel —
+                    // slowly, so a single noisy fix never yanks the trail.
+                    val domAlpha = (dt / (DOMINANT_TAU_S + dt))
+                    val d = GeoUtils.angleDiffDeg(velHeading.toDouble(), dominantHeadingDeg.toDouble())
+                    dominantHeadingDeg = GeoUtils.normalizeHeading(
+                        (dominantHeadingDeg + (d * domAlpha)).toFloat()
+                    )
+                }
+                // While moving straight, gently pull travel heading toward the
+                // dominant vector: this is the "adjust the vector majorly toward
+                // the actual path" correction.
+                if (!turning && filtSpeed > DOMINANT_MIN_SPEED) {
+                    val pullAlpha = (dt / (HEADING_PULL_TAU_S + dt))
+                    val dh = GeoUtils.angleDiffDeg(dominantHeadingDeg.toDouble(), fusedHeading.toDouble())
+                    val pulled = fusedHeading.toDouble() + dh * pullAlpha
+                    fusedHeading = GeoUtils.normalizeHeading(pulled.toFloat())
+                }
+            }
+            // 6c. Heading rate limiter: a car cannot spin faster than this.
+            val prevH = vehicleHeadingDeg.toDouble()
+            val rawDelta = GeoUtils.angleDiffDeg(fusedHeading.toDouble(), if (elapsed <= dt + 1e-9) fusedHeading.toDouble() else prevH)
+            val maxStep = HEADING_MAX_RATE_DEG_S * dt
+            val limited = rawDelta.coerceIn(-maxStep, maxStep)
+            fusedHeading = GeoUtils.normalizeHeading(
+                ((if (elapsed <= dt + 1e-9) fusedHeading.toDouble() else prevH) + limited).toFloat()
+            )
+            vehicleHeadingDeg = fusedHeading
+            yawRad = Math.toRadians(vehicleHeadingDeg.toDouble())
+            sinH = sin(yawRad)
+            cosH = cos(yawRad)
+            // Re-express the velocity along the (possibly pulled) heading so the
+            // position step follows the corrected direction.
+            ve = sinH * forwardSpeed + cosH * lateralVel
+            vn = cosH * forwardSpeed - sinH * lateralVel
 
             val fresh = isGnssFresh()
             gpsAvailable = fresh
             if (!fresh) {
                 status = if (autoSnapActive) "GPS OFF: inertial + road snap"
+                else if (trailSnapActive) "GPS OFF: inertial + trail memory"
                 else if (route.size >= 2 && !lateralFailure) "GPS OFF: inertial + route"
                 else if (isStep) "GPS OFF: pedestrian DR (walking)"
                 else "GPS OFF: inertial dead reckoning"
@@ -356,21 +556,37 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         // 7. Advance RAW position
         x += ve * dt
         y += vn * dt
+        pushRecentRaw(x, y)
 
-        // 8. Map Matching / Snapping on a Copy
+        // 8. Map Matching / Snapping on a Copy (priority: route > trail > auto)
         var outX = x; var outY = y; var outVe = ve; var outVn = vn
+        snapMode = if (isStationary) "ZUPT" else "FREE"
         val routeMatch = constrainToRoute(x, y, forwardSpeed)
         if (routeMatch != null) {
             outX = routeMatch.x; outY = routeMatch.y
             outVe = routeMatch.ve; outVn = routeMatch.vn
             routeS = routeMatch.routeS
+            snapMode = "ROUTE"
+            trailSnapActive = false
+            autoSnapActive = autoSnapped
         } else {
-            val snap = autoSnapToRoad(x, y, forwardSpeed)
-            if (snap != null) {
-                outX = snap.x; outY = snap.y
-                outVe = snap.ve; outVn = snap.vn
+            val trailMatch = snapToTrail(x, y, vehicleHeadingDeg, forwardSpeed)
+            if (trailMatch != null) {
+                outX = trailMatch.x; outY = trailMatch.y
+                outVe = trailMatch.ve; outVn = trailMatch.vn
+                snapMode = if (trReversed) "TRAIL-REV" else "TRAIL"
+            } else {
+                val snap = autoSnapToRoad(x, y, forwardSpeed)
+                if (snap != null) {
+                    outX = snap.x; outY = snap.y
+                    outVe = snap.ve; outVn = snap.vn
+                    snapMode = "AUTO"
+                }
             }
         }
+
+        // Remember the driven path (decimated): future backtracks snap to this.
+        addTrailPoint(outX, outY, vehicleHeadingDeg)
 
         val outHeadingDeg = if (hypot(outVe, outVn) > 0.5) {
             GeoUtils.normalizeHeading(Math.toDegrees(atan2(outVe, outVn)).toFloat())
@@ -392,19 +608,25 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
 
         checkFrozen(outX, outY)
 
-        // Engine debug reporter snapshot (for CSV export and evaluation)
+        // Engine debug reporter snapshot: EVERY field populated on EVERY sample so
+        // nav/pdr/imu rows stay consistent and joinable on timestamp_nanos.
+        val deviceRad = if (deviceYawDeg != null) Math.toRadians(deviceYawDeg).toFloat() else Float.NaN
         lastDebug = com.sih.idr.navigation.pdr.PdrDebug(
             timestampNanos = sample.timestampNanos,
             accMagnitude = lastAccMag,
             stepDetected = isStep,
-            strideLength = if (isStep) 0.75f else Float.NaN,
-            gyroHeadingRad = Math.toRadians(vehicleHeadingDeg.toDouble()).toFloat(),
-            magHeadingRad = Float.NaN,
+            strideLength = (forwardSpeed * dt).toFloat(),
+            gyroHeadingRad = Math.toRadians(gyroHeadingDeg.toDouble()).toFloat(),
+            magHeadingRad = deviceRad,
             fusedHeadingRad = Math.toRadians(outHeadingDeg.toDouble()).toFloat(),
             xEast = outX.toFloat(),
             yNorth = outY.toFloat(),
             latitude = ll.first,
-            longitude = ll.second
+            longitude = ll.second,
+            forwardSpeedMps = forwardSpeed.toFloat(),
+            yawRateDegS = yawRateDegS.toFloat(),
+            lateralVelMps = lateralVel.toFloat(),
+            snapMode = snapMode
         )
 
         return next
@@ -457,11 +679,20 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
                         mountOffsetDeg += 0.08 * GeoUtils.angleDiffDeg(targetOffset, mountOffsetDeg)
                     }
                     forwardSpeed = spd.toDouble()
+                    lateralVel = 0.0
                     val hRad = Math.toRadians(bearingDeg)
                     ve = forwardSpeed * sin(hRad)
                     vn = forwardSpeed * cos(hRad)
+                    filtVe = ve
+                    filtVn = vn
+                    filtInit = true
+                    vehicleHeadingDeg = GeoUtils.normalizeHeading(bearingDeg.toFloat())
+                    gyroHeadingDeg = vehicleHeadingDeg
+                    dominantHeadingDeg = vehicleHeadingDeg
+                    dominantInit = true
                 } else if (spd < 0.5f) {
                     forwardSpeed = 0.0
+                    lateralVel = 0.0
                     ve = 0.0; vn = 0.0
                 }
             }
@@ -480,7 +711,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         status = if (route.size >= 2) "GNSS fused: route constrained" else "GNSS fused: inertial calibrated"
     }
 
-    private data class Matched(val x: Double, val y: Double, val ve: Double, val vn: Double, val routeS: Double = 0.0)
+    internal data class Matched(val x: Double, val y: Double, val ve: Double, val vn: Double, val routeS: Double = 0.0)
 
     private fun isGnssFresh(nowMs: Long = System.currentTimeMillis()): Boolean {
         if (lastGnssMillis < 0) return false
@@ -517,7 +748,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         }
     }
 
-    private fun constrainToRoute(rawX: Double, rawY: Double, rawSpeed: Double): Matched? {
+    internal fun constrainToRoute(rawX: Double, rawY: Double, rawSpeed: Double = forwardSpeed): Matched? {
         if (route.size < 2 || routeCumDist.size != route.size) return null
         var best = Double.POSITIVE_INFINITY
         var bx = rawX; var by = rawY; var bs = routeS
@@ -559,6 +790,135 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         val mve = tx * rawSpeed
         val mvn = ty * rawSpeed
         return Matched(bx, by, mve, mvn, bs)
+    }
+
+    // ---------------------------------------------------------------- trail memory
+    private fun addTrailPoint(outX: Double, outY: Double, headingDeg: Float) {
+        if (isStationary || forwardSpeed < TRAIL_MIN_SPEED) return
+        if (lastTrailX.isNaN() || hypot(outX - lastTrailX, outY - lastTrailY) >= TRAIL_MIN_DIST_M) {
+            trailE.addLast(outX); trailN.addLast(outY); trailH.addLast(headingDeg)
+            lastTrailX = outX; lastTrailY = outY
+            while (trailE.size > TRAIL_MAX_POINTS) {
+                trailE.removeFirst(); trailN.removeFirst(); trailH.removeFirst()
+            }
+        }
+    }
+
+    private fun pushRecentRaw(rawX: Double, rawY: Double) {
+        if (lastRecentX.isNaN() || hypot(rawX - lastRecentX, rawY - lastRecentY) >= RECENT_MIN_DIST_M) {
+            recentRawE.addLast(rawX); recentRawN.addLast(rawY)
+            lastRecentX = rawX; lastRecentY = rawY
+            while (recentRawE.size > RECENT_MAX_POINTS) {
+                recentRawE.removeFirst(); recentRawN.removeFirst()
+            }
+        }
+    }
+
+    /** Recent raw motion vector (for the resemblance gate): null when too short. */
+    private fun recentMotion(): Triple<Double, Double, Double>? {
+        if (recentRawE.size < 2) return null
+        val e0 = recentRawE.first(); val n0 = recentRawN.first()
+        val e1 = recentRawE.last(); val n1 = recentRawN.last()
+        val dx = e1 - e0; val dy = n1 - n0
+        val len = hypot(dx, dy)
+        if (len < TRAIL_RESEMBLE_MIN_LEN_M) return null
+        return Triple(dx / len, dy / len, len)
+    }
+
+    /**
+     * Snap onto the remembered driven path when the fresh trail resembles it.
+     * Accepts BOTH travel directions (forward + reverse/backtrack): a U-turn or
+     * return leg re-pins to the old centerline instead of starting a parallel
+     * ghost trail. Throttled with a cached edge like the road-graph snap.
+     */
+    internal fun snapToTrail(rawX: Double, rawY: Double, headingDeg: Float, rawSpeed: Double): Matched? {
+        trailSnapActive = false
+        if (trailE.size < 2 || rawSpeed < TRAIL_MIN_SPEED) {
+            trHasEdge = false
+            return null
+        }
+        val moved = hypot(rawX - lastTrailQueryX, rawY - lastTrailQueryY)
+        val due = !trHasEdge || moved > TRAIL_REQUERY_M || elapsed - lastTrailQueryElapsed > TRAIL_REQUERY_S
+        if (due) {
+            lastTrailQueryX = rawX; lastTrailQueryY = rawY; lastTrailQueryElapsed = elapsed
+            val edge = findTrailEdge(rawX, rawY, headingDeg) ?: run {
+                trHasEdge = false
+                return null
+            }
+            trAx = edge[0]; trAy = edge[1]; trBx = edge[2]; trBy = edge[3]
+            trReversed = edge[4] < 0
+            trHasEdge = true
+        }
+        if (!trHasEdge) return null
+        val dx = trBx - trAx; val dy = trBy - trAy
+        val l2 = dx * dx + dy * dy
+        if (l2 < 1.0) {
+            trHasEdge = false
+            return null
+        }
+        val tRaw = ((rawX - trAx) * dx + (rawY - trAy) * dy) / l2
+        if (tRaw < -0.05 || tRaw > 1.05) {
+            trHasEdge = false
+            return null
+        }
+        val t = tRaw.coerceIn(0.0, 1.0)
+        val qx = trAx + t * dx; val qy = trAy + t * dy
+        if (hypot(rawX - qx, rawY - qy) > TRAIL_SNAP_RADIUS_M) {
+            trHasEdge = false
+            return null
+        }
+        var ux = dx / sqrt(l2); var uy = dy / sqrt(l2)
+        val hRad = Math.toRadians(headingDeg.toDouble())
+        val hx = sin(hRad); val hy = cos(hRad)
+        if (ux * hx + uy * hy < 0) {
+            ux = -ux; uy = -uy
+        }
+        trailSnapActive = true
+        return Matched(qx, qy, ux * rawSpeed, uy * rawSpeed)
+    }
+
+    /**
+     * Finds the trail segment that best explains the current motion.
+     * Returns [ax, ay, bx, by, dirSign] or null. Requires BOTH proximity AND
+     * resemblance: the recent raw motion must parallel the old segment (same or
+     * opposite direction) so jitter near an old parking spot cannot pin the fix.
+     */
+    private fun findTrailEdge(rawX: Double, rawY: Double, headingDeg: Float): DoubleArray? {
+        val motion = recentMotion()
+        val hRad = Math.toRadians(headingDeg.toDouble())
+        val hx = sin(hRad); val hy = cos(hRad)
+        var bestScore = Double.POSITIVE_INFINITY
+        var best: DoubleArray? = null
+        // Stride 1 over ≤2000 points is fine at the throttled requery rate.
+        for (i in 0 until trailE.size - 1) {
+            val ax = trailE[i]; val ay = trailN[i]
+            val bx = trailE[i + 1]; val by = trailN[i + 1]
+            val dx = bx - ax; val dy = by - ay
+            val len = hypot(dx, dy)
+            if (len < 1e-6) continue
+            val ux = dx / len; val uy = dy / len
+            val t = (((rawX - ax) * dx + (rawY - ay) * dy) / (len * len)).coerceIn(0.0, 1.0)
+            val qx = ax + t * dx; val qy = ay + t * dy
+            val d = hypot(rawX - qx, rawY - qy)
+            if (d > TRAIL_SNAP_RADIUS_M) continue
+            val align = ux * hx + uy * hy // +1 same dir, -1 reverse
+            // Resemblance gate: heading must match the old segment either way.
+            // Reverse/backtrack legs match with align ≈ -1 — that is the point.
+            if (abs(align) < TRAIL_MIN_ALIGN) continue
+            if (motion != null) {
+                val mAlign = motion.first * ux + motion.second * uy
+                if (abs(mAlign) < TRAIL_MIN_ALIGN) continue
+            }
+            // Prefer close + aligned; small bonus for same-direction continuity.
+            val score = d - TRAIL_ALIGN_WEIGHT_M * abs(align)
+            if (score < bestScore) {
+                bestScore = score
+                // Don't look further back than a short window behind the query:
+                // prevents teleporting to a parallel old lap across town.
+                best = doubleArrayOf(ax, ay, bx, by, if (align >= 0) 1.0 else -1.0)
+            }
+        }
+        return best
     }
 
     private fun autoSnapToRoad(rawX: Double, rawY: Double, rawSpeed: Double): Matched? {
@@ -657,8 +1017,15 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         elapsed = 0.0
         x = 0.0; y = 0.0
         forwardSpeed = 0.0
+        lateralVel = 0.0
         ve = 0.0; vn = 0.0
+        filtVe = 0.0; filtVn = 0.0; filtInit = false
+        dominantHeadingDeg = 0f; dominantInit = false
         vehicleHeadingDeg = 0f
+        gyroHeadingDeg = 0f; gyroHeadingInit = false
+        lastDeviceYawDeg = null
+        yawRateDegS = 0.0
+        lpGyroMag = 0.0
         mountOffsetDeg = 0.0
         mountCalibrated = false
         biasE = 0.0; biasN = 0.0
@@ -680,12 +1047,25 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         gnssRejectStreak = 0; gnssRejects = 0
         autoHasEdge = false; autoSnapped = false; autoSnapActive = false
         lastSnapX = 0.0; lastSnapY = 0.0; lastSnapElapsed = -1.0
+        trailE.clear(); trailN.clear(); trailH.clear()
+        lastTrailX = Double.NaN; lastTrailY = Double.NaN
+        trHasEdge = false; trReversed = false; trailSnapActive = false
+        snapMode = "FREE"
+        lastTrailQueryX = 0.0; lastTrailQueryY = 0.0; lastTrailQueryElapsed = -1.0
+        recentRawE.clear(); recentRawN.clear()
+        lastRecentX = Double.NaN; lastRecentY = Double.NaN
         lastOutX = Double.NaN; lastOutY = Double.NaN; lastMoveElapsed = 0.0; freezeLogged = false
     }
 
     companion object {
         /** IIR low-pass alpha on linear accel before integration (~4 Hz @100 Hz). */
         private const val ACC_LP_ALPHA = 0.25
+        /** IIR low-pass alpha on gyro magnitude for the turn-energy gate. */
+        private const val GYRO_LP_ALPHA = 0.1
+        /** Yaw-rate EMA alpha per sample (~0.5 s time constant @100 Hz). */
+        private const val YAW_RATE_ALPHA = 0.05
+        /** Per-sample pull of the gyro heading toward absolute device yaw. */
+        private const val GYRO_ANCHOR_W = 0.02
         /** Per-step accel magnitude clamp (m/s^2). */
         private const val ACC_MAX = 20.0
         /** Maximum forward acceleration allowed for vehicle integration (m/s^2). */
@@ -696,6 +1076,31 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         private const val V_MAX = 55.0
         /** Aerodynamic & rolling coast drag per second. */
         private const val COAST_DRAG_COEFF = 0.02
+        /** Major-velocity-vector EMA time constant (s). */
+        private const val VEL_FILTER_TAU_S = 0.4
+        /** Below this filtered speed the velocity heading is noise: ignore (m/s). */
+        private const val VEL_HEADING_MIN_SPEED = 1.5
+        /** Dominant-path latch needs real motion (m/s). */
+        private const val DOMINANT_MIN_SPEED = 2.5
+        /** Dominant heading adaptation time constant (s): slow = stable. */
+        private const val DOMINANT_TAU_S = 2.0
+        /** Travel-heading pull toward the dominant vector, time constant (s). */
+        private const val HEADING_PULL_TAU_S = 3.0
+        /** Heading rate limiter (deg/s): a car cannot spin faster. */
+        private const val HEADING_MAX_RATE_DEG_S = 100.0
+        /** Above this yaw rate the vehicle is turning: suppress lateral (deg/s). */
+        private const val TURN_YAW_RATE_DEG_S = 15.0
+        /** Gyro-magnitude turn gate fallback when attitude is unknown (rad/s). */
+        private const val TURN_GYRO_MAG_RAD_S = 0.25
+        /** Lateral accel residual scale while turning (centripetal already removed). */
+        private const val TURN_LAT_SUPPRESS = 0.3
+        /** Lateral velocity damping, 1/s, plus yaw-rate-proportional turn term. */
+        private const val LAT_BASE_DAMP = 1.5
+        private const val LAT_TURN_GAIN = 2.0
+        /** Sideways velocities below this while going straight are MEMS noise (m/s). */
+        private const val LAT_DEADBAND_MPS = 0.25
+        /** Hard bound on residual lateral velocity (m/s). */
+        private const val LAT_MAX_MPS = 8.0
         /** Standstill detection gyro threshold (rad/s). */
         private const val STANDSTILL_GYRO_MAX = 0.06
         /** Standstill detection linear accel threshold (m/s^2). */
@@ -726,5 +1131,19 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         private const val AUTO_SNAP_REQUERY_S = 2.0
         /** Lateral pin limit, same semantics as the planned-route gate (m). */
         private const val AUTO_SNAP_MAX_DIST_M = 30.0
+        /** Trail memory: decimate, cap, and snap gates. */
+        private const val TRAIL_MIN_DIST_M = 2.0
+        private const val TRAIL_MAX_POINTS = 2000
+        private const val TRAIL_MIN_SPEED = 1.0
+        private const val TRAIL_SNAP_RADIUS_M = 20.0
+        private const val TRAIL_REQUERY_M = 5.0
+        private const val TRAIL_REQUERY_S = 1.5
+        /** |align| above this counts as resembling the old segment (either way). */
+        private const val TRAIL_MIN_ALIGN = 0.5
+        private const val TRAIL_ALIGN_WEIGHT_M = 10.0
+        /** Recent raw motion must span this before the resemblance gate applies (m). */
+        private const val TRAIL_RESEMBLE_MIN_LEN_M = 6.0
+        private const val RECENT_MIN_DIST_M = 1.0
+        private const val RECENT_MAX_POINTS = 60
     }
 }
