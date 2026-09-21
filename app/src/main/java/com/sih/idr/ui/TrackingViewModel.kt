@@ -79,14 +79,14 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
      * (BaselineDeadReckoningEngine.kt is retained in the repo but inactive.)
      */
     private val pdrConfig = PdrConfig()
-    private val vehicleEngine = com.sih.idr.navigation.RouteAwareFusionEngine()
+    private val vehicleEngine = com.sih.idr.navigation.PaperDeadReckoningEngine()
     private val roadGraph = com.sih.idr.navigation.OfflineRoadGraphCatalog.fromAssets(app.applicationContext, listOf("road_graph_guntur.json", "road_graph_vijayawada.json"))
     private val routeCache = RouteCache(app.applicationContext)
     private val engine: DeadReckoningEngine = vehicleEngine
 
     /** Shown in the UI so a vehicle test is never mistaken for the final model. */
     val engineLabel: String =
-        "Vehicle route-aware fusion · IMU + GNSS + route constraint"
+        "ICARCV 2014 Vehicular DR · STFT 1Hz Filter + Phone-Frame θ / φ Integration"
 
     // ------------------------------------------------------------------ switches
     /** Testing Mode ON: GPS runs continuously as independent ground truth. */

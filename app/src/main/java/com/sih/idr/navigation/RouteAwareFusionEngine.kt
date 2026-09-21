@@ -480,7 +480,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         status = if (route.size >= 2) "GNSS fused: route constrained" else "GNSS fused: inertial calibrated"
     }
 
-    private data class Matched(val x: Double, val y: Double, val ve: Double, val vn: Double, val routeS: Double = 0.0)
+    internal data class Matched(val x: Double, val y: Double, val ve: Double, val vn: Double, val routeS: Double = 0.0)
 
     private fun isGnssFresh(nowMs: Long = System.currentTimeMillis()): Boolean {
         if (lastGnssMillis < 0) return false
@@ -517,7 +517,7 @@ class RouteAwareFusionEngine : DeadReckoningEngine, EngineDebugReporter {
         }
     }
 
-    private fun constrainToRoute(rawX: Double, rawY: Double, rawSpeed: Double): Matched? {
+    internal fun constrainToRoute(rawX: Double, rawY: Double, rawSpeed: Double): Matched? {
         if (route.size < 2 || routeCumDist.size != route.size) return null
         var best = Double.POSITIVE_INFINITY
         var bx = rawX; var by = rawY; var bs = routeS

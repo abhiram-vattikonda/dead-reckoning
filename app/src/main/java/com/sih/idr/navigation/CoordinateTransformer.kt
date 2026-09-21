@@ -44,9 +44,11 @@ object CoordinateTransformer {
      * World gravity = (0, 0, -g); phone gravity = R^T * worldGravity.
      */
     fun gravityInPhoneFrame(r: FloatArray, out: FloatArray, g: Float = SensorManager.GRAVITY_EARTH) {
-        out[0] = -g * r[6]
-        out[1] = -g * r[7]
-        out[2] = -g * r[8]
+        // Accelerometer measures upward reaction force (+g when flat screen-up).
+        // Projected into phone frame: R^T * [0, 0, +g].
+        out[0] = g * r[6]
+        out[1] = g * r[7]
+        out[2] = g * r[8]
     }
 
     fun yawPitchRollDeg(r: FloatArray): FloatArray {

@@ -16,15 +16,18 @@ class RouteAwareFusionEngineTest {
         lon: Double = 80.4365,
         speed: Float = 0f,
         heading: Float = 0f
-    ): NavigationState = NavigationState(
-        timestampNanos = 1_000_000_000L,
-        latitude = lat,
-        longitude = lon,
-        altitude = 20.0,
-        velEast = 0f,
-        velNorth = 0f,
-        headingDeg = heading
-    )
+    ): NavigationState {
+        val hRad = Math.toRadians(heading.toDouble())
+        return NavigationState(
+            timestampNanos = 1_000_000_000L,
+            latitude = lat,
+            longitude = lon,
+            altitude = 20.0,
+            velEast = (speed * kotlin.math.sin(hRad)).toFloat(),
+            velNorth = (speed * kotlin.math.cos(hRad)).toFloat(),
+            headingDeg = heading
+        )
+    }
 
     @Test
     fun testStandstillZuptArrestsDrift() {
@@ -65,11 +68,8 @@ class RouteAwareFusionEngineTest {
         engine.setRouteLatLon(listOf(p0, p1))
 
         // Move 25 meters East (15 meters beyond the segment end)
-        val beyond = com.sih.idr.utils.GeoUtils.moveEnu(startLat, startLon, 0.0, 25.0)
-        val enu25 = com.sih.idr.utils.GeoUtils.geodeticToEnu(beyond.first, beyond.second, 0.0, startLat, startLon, 0.0)
-
         // Segment 0: from (0,0) to (10,0)
-        val snapped = engine.constrainToRoute(enu25.x, enu25.y)
+        val snapped = engine.constrainToRoute(25.0, 0.0, 5.0)
         // Since tRaw = 25/10 = 2.5 > 1.05, it must NOT snap to the end vertex (10.0, 0.0)!
         assertNull("Vehicle beyond segment must not be locked to endpoint", snapped)
     }
@@ -85,7 +85,7 @@ class RouteAwareFusionEngineTest {
             for (i in 0 until 50) { // 500ms per cycle
                 timeNanos += 10_000_000L
                 val isPeak = (i == 10)
-                val az = if (isPeak) 14.5f else 9.81f
+                val az = if (isPeak) 14.5f else if (i in 25..35) 7.0f else 9.81f
                 val sample = ImuSample(
                     timestampNanos = timeNanos,
                     accelX = 0f, accelY = 0.5f, accelZ = az,
@@ -133,7 +133,6 @@ class RouteAwareFusionEngineTest {
         }
 
         assertNotNull(lastState)
-        // Vehicle heading is North (0 deg), forward speed should increase
         assertTrue("Forward speed should increase under forward acceleration", engine.forwardSpeed > 5.0)
         // North velocity should increase, East velocity should remain near zero
         assertTrue("North velocity should be positive", (lastState?.velNorth ?: 0f) > 5.0f)
@@ -164,7 +163,7 @@ class RouteAwareFusionEngineTest {
                 accelX = 0f, accelY = 0f, accelZ = 9.81f,
                 gyroX = 0.0f, gyroY = 0.0f, gyroZ = 0.0f,
                 linearX = 0f, linearY = 0f, linearZ = 0f,
-                quatX = 0f, quatY = 0f, quatZ = 0.7071f, quatW = 0.7071f // heading ~90 deg East
+                quatX = 0f, quatY = 0f, quatZ = -0.7071f, quatW = 0.7071f // heading ~90 deg East
             )
             engine.processImu(sample)
         }
