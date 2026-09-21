@@ -73,20 +73,21 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * >>> SINGLE SWAP SITE FOR ENGINES <<<
-     * Current: GitHubStylePdrEngine (pedestrian baseline ported from
-     * nisargnp/DeadReckoning). Future: MMMDeadReckoningEngine — same
-     * DeadReckoningEngine interface, nothing else in the app changes.
-     * (BaselineDeadReckoningEngine.kt is retained in the repo but inactive.)
+     * Current: IekfDeadReckoningEngine — 21-state Invariant EKF, full 3D INS
+     * strapdown + Non-Holonomic Constraints + ZUPT + open-loop map snap.
+     * Paper: Brossard et al., "AI-IMU Dead-Reckoning", IEEE-TIV 2020.
+     * Future: MMMDeadReckoningEngine — same DeadReckoningEngine interface.
+     * (RouteAwareFusionEngine and GitHubStylePdrEngine are retained for comparison.)
      */
     private val pdrConfig = PdrConfig()
-    private val vehicleEngine = com.sih.idr.navigation.RouteAwareFusionEngine()
+    private val vehicleEngine = com.sih.idr.navigation.IekfDeadReckoningEngine()
     private val roadGraph = com.sih.idr.navigation.OfflineRoadGraphCatalog.fromAssets(app.applicationContext, listOf("road_graph_guntur.json", "road_graph_vijayawada.json"))
     private val routeCache = RouteCache(app.applicationContext)
     private val engine: DeadReckoningEngine = vehicleEngine
 
     /** Shown in the UI so a vehicle test is never mistaken for the final model. */
     val engineLabel: String =
-        "Vehicle route-aware fusion · IMU + GNSS + route constraint"
+        "IEKF INS · 21-state invariant EKF + NHC + ZUPT + map snap (IMU only)"
 
     // ------------------------------------------------------------------ switches
     /** Testing Mode ON: GPS runs continuously as independent ground truth. */
@@ -581,7 +582,11 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------- internals
     private fun beginSession() {
-        session = TestSession(startTimestampMillis = System.currentTimeMillis())
+        val bootOffsetMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
+        session = TestSession(
+            startTimestampMillis = System.currentTimeMillis(),
+            sensorBootOffsetMs = bootOffsetMs
+        )
         val startFix = gpsManager.lastFix.value ?: getCachedLocationFix()
         startFix?.let { fix ->
             session?.gpsSamples?.add(fix)
@@ -610,9 +615,11 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
     private fun onImuSample(sample: com.sih.idr.data.ImuSample) {
         if (!_isRecording.value) return
         val s = session ?: return
-        s.imuSamples.add(sample) // IMU always logged during a session
-        if (s.imuSamples.size > MAX_IMU_SAMPLES) {
-            repeat(TRIM_CHUNK) { s.imuSamples.removeAt(0) }
+        synchronized(s) {
+            s.imuSamples.add(sample) // IMU always logged during a session
+            if (s.imuSamples.size > MAX_IMU_SAMPLES) {
+                repeat(TRIM_CHUNK) { s.imuSamples.removeAt(0) }
+            }
         }
         if (!navEngineEnabled.value) {
             // Navigation engine off: no DR processing at all.
@@ -621,33 +628,35 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val nav = engine.processImu(sample)
-        s.drStates.add(nav)
-        if (s.drStates.size > MAX_DR_STATES) {
-            repeat(TRIM_CHUNK) { s.drStates.removeAt(0) }
-        }
-        // Engine intermediates on the shared sensor-time grid: every step
-        // (event row) plus the 10 Hz track row — via EngineDebugReporter so ANY
-        // active engine is logged with the same buffer discipline.
-        // Via the EngineDebugReporter interface so ANY active engine is logged.
-        (engine as? EngineDebugReporter)?.lastDebug?.let { dbg ->
-            val sensorMs = sample.timestampNanos / 1_000_000
-            val due = dbg.stepDetected ||
-                lastPdrLogSensorMs == Long.MIN_VALUE ||
-                sensorMs - lastPdrLogSensorMs >= LOG_DECIM_SENSOR_MS
-            if (due) {
-                lastPdrLogSensorMs = sensorMs
-                s.pdrDebug.add(dbg)
-                if (s.pdrDebug.size > MAX_PDR_DEBUG) {
-                    repeat(TRIM_CHUNK) { s.pdrDebug.removeAt(0) }
+        val sensorMs = sample.timestampNanos / 1_000_000
+        val dbgRef = (engine as? EngineDebugReporter)?.lastDebug
+        val drDue = (dbgRef?.stepDetected == true) ||
+            lastDrPointSensorMs == Long.MIN_VALUE ||
+            sensorMs - lastDrPointSensorMs >= LOG_DECIM_SENSOR_MS
+
+        synchronized(s) {
+            s.drStates.add(nav)
+            if (s.drStates.size > MAX_DR_STATES) {
+                repeat(TRIM_CHUNK) { s.drStates.removeAt(0) }
+            }
+            dbgRef?.let { dbg ->
+                val due = dbg.stepDetected ||
+                    lastPdrLogSensorMs == Long.MIN_VALUE ||
+                    sensorMs - lastPdrLogSensorMs >= LOG_DECIM_SENSOR_MS
+                if (due) {
+                    lastPdrLogSensorMs = sensorMs
+                    s.pdrDebug.add(dbg)
+                    if (s.pdrDebug.size > MAX_PDR_DEBUG) {
+                        repeat(TRIM_CHUNK) { s.pdrDebug.removeAt(0) }
+                    }
                 }
             }
-        }
-        val sensorMs = sample.timestampNanos / 1_000_000
-        if (lastDrPointSensorMs == Long.MIN_VALUE ||
-            sensorMs - lastDrPointSensorMs >= LOG_DECIM_SENSOR_MS
-        ) { // 10 Hz nav output decimation on the same sensor grid
-            lastDrPointSensorMs = sensorMs
-            s.drTrajectory.add(TrajectoryPoint(System.currentTimeMillis(), nav.latitude, nav.longitude))
+            if (drDue) {
+                lastDrPointSensorMs = sensorMs
+                // Wall-clock timestamp: sensor boot → wall using session offset
+                val wallMs = sensorMs + (session?.sensorBootOffsetMs ?: 0L)
+                s.drTrajectory.add(TrajectoryPoint(wallMs, nav.latitude, nav.longitude))
+            }
         }
         maybeCheckRoute() // off-route detection runs on the DR (IMU) stream: no GPS needed
         val wall = System.currentTimeMillis()
@@ -663,8 +672,10 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val s = session ?: return
-        s.gpsSamples.add(sample)
-        s.gpsTrajectory.add(TrajectoryPoint(sample.timestampMillis, sample.latitude, sample.longitude))
+        synchronized(s) {
+            s.gpsSamples.add(sample)
+            s.gpsTrajectory.add(TrajectoryPoint(sample.timestampMillis, sample.latitude, sample.longitude))
+        }
         if (plannedRouteLatLon.isEmpty()) {
             destination?.let { (lat, lon) ->
                 roadGraph.routeLatLon(sample.latitude, sample.longitude, lat, lon, sample.bearing?.toDouble()).let { route ->
@@ -693,8 +704,20 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
         if (!force && wall - lastUiPushMs < 200L) return
         lastUiPushMs = wall
         val s = session
-        val gpsTraj = s?.gpsTrajectory?.toList() ?: emptyList()
-        val drTraj = s?.drTrajectory?.toList() ?: emptyList()
+        var gpsTraj: List<TrajectoryPoint> = emptyList()
+        var drTraj: List<TrajectoryPoint> = emptyList()
+        var gpsCount = 0
+        var drStateCount = 0
+        var stepCount = vehicleEngine.stepCount
+        if (s != null) {
+            synchronized(s) {
+                gpsTraj = s.gpsTrajectory.toList()
+                drTraj = s.drTrajectory.toList()
+                gpsCount = s.gpsSamples.size
+                drStateCount = s.drStates.size
+                stepCount = s.pdrDebug.count { it.stepDetected }
+            }
+        }
         val stats = if (s != null && gpsTraj.isNotEmpty() && drTraj.isNotEmpty()) {
             if (_isRecording.value) EvaluationManager.liveStats(gpsTraj, drTraj) else s.stats
         } else SessionStats()
@@ -706,9 +729,9 @@ class TrackingViewModel(app: Application) : AndroidViewModel(app) {
             stats = stats,
             imuCount = imuManager.sampleCount,
             imuHz = imuManager.measuredHz,
-            gpsCount = s?.gpsSamples?.size ?: 0,
-            drStateCount = s?.drStates?.size ?: 0,
-            stepCount = s?.pdrDebug?.count { it.stepDetected } ?: vehicleEngine.stepCount,
+            gpsCount = gpsCount,
+            drStateCount = drStateCount,
+            stepCount = stepCount,
             locationOn = isLocationEnabled()
             ,plannedRoute = plannedRouteLatLon.mapIndexed { i, p -> TrajectoryPoint(i.toLong(), p.first, p.second) }
             ,engineHealth = buildString {

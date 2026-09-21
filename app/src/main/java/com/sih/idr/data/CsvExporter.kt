@@ -85,8 +85,10 @@ object CsvExporter {
                         dPrevLat, dPrevLon, d.latitude, d.longitude)
                 }
                 dPrevLat = d.latitude; dPrevLon = d.longitude
+                // Fix: convert sensor-boot time → wall-clock ms using the session offset.
+                val wallMs = (d.timestampNanos / 1_000_000) + session.sensorBootOffsetMs
                 w.write(listOf(
-                    (d.timestampNanos / 1_000_000).toString(),
+                    wallMs.toString(),
                     "", "", "", "", "",
                     d.latitude.toString(), d.longitude.toString(),
                     d.speed.toString(), d.headingDeg.toString(),
@@ -122,7 +124,8 @@ object CsvExporter {
             w.write("timestamp_nanos,acc_mag,step_detected,stride_length," +
                 "gyro_heading_rad,mag_heading_rad,fused_heading_rad," +
                 "dr_x_east,dr_y_north,dr_lat,dr_lon," +
-                "forward_speed_mps,yaw_rate_deg_s,lateral_vel_mps,snap_mode\n")
+                "forward_speed_mps,yaw_rate_deg_s,lateral_vel_mps,snap_mode," +
+                "bias_omega_mag,bias_acc_mag,nhc_residual_lat\n")
             for (d in pdrDebug) {
                 w.write(listOf(
                     d.timestampNanos.toString(),
@@ -139,7 +142,10 @@ object CsvExporter {
                     d.forwardSpeedMps.toString(),
                     d.yawRateDegS.toString(),
                     d.lateralVelMps.toString(),
-                    d.snapMode
+                    d.snapMode,
+                    d.biasOmegaMag.toString(),
+                    d.biasAccMag.toString(),
+                    d.nhcResidualLat.toString()
                 ).joinToString(",") + "\n")
             }
         }

@@ -93,6 +93,14 @@ data class SessionStats(
 data class TestSession(
     val startTimestampMillis: Long,
     var endTimestampMillis: Long? = null,
+    /**
+     * Offset to convert sensor-boot time → wall clock:
+     *   wallMs = (sample.timestampNanos / 1_000_000) + sensorBootOffsetMs
+     * Captured once at session start with:
+     *   System.currentTimeMillis() - SystemClock.elapsedRealtime()
+     * Zero for sessions recorded before this fix.
+     */
+    val sensorBootOffsetMs: Long = 0L,
     val gpsSamples: MutableList<GpsSample> = mutableListOf(),
     val imuSamples: MutableList<ImuSample> = mutableListOf(),
     val drStates: MutableList<NavigationState> = mutableListOf(),
